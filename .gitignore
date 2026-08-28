@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+artifacts/
+.codex_tmp/
+runs/
+tmp/
+cpp/build/
+cpp/install/
+.idea/
+.venv/
+*.wav
+*.h265
+*.sdp
