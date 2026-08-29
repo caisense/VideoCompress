@@ -101,6 +101,40 @@ changing the Codec2 payload layout or the shared physical ceiling. Audio capture
 encode and UDP sending are separate workers; the handoff is a whole-RTP-packet
 queue capped at 160 ms, so stale speech is discarded instead of replayed late.
 
+## 四类检测事件推送：ROEV/1 UDP `5010`
+
+完成本次版本的编译与部署后，YOLOv8-Seg 在任意非 `baseline` 模式中检测到
+`person`、`car`、`boat` 或 `airplane` 时，会额外发送一个很小的 **ROEV/1** 私有 UDP
+状态数据报。它不是 RTP 扩展，不修改标准 H.265 码流，也不需要 SDP；因此可与视频 HUD、
+RB/1、图片接收和 Codec2 音频接收器同时运行。
+
+事件根据独立的 `--event-min-confidence=0.35` 在 **ROI/图片/rebuild 过滤之前**从原始
+RKNN 结果生成：目标集合变化时立即发送 `STATE`；目标持续存在时按
+`--event-heartbeat-ms=1000` 重复当前完整状态，以便 UDP 丢失一次进入/退出通知后仍能恢复。
+空闲且没有目标时不发保活包。默认启用，端口为 `5010`；可通过
+`--event-push=off` 关闭，或用 `--event-udp-port` 改端口。
+
+先在 Windows PC 的独立终端启动接收器：
+
+```powershell
+cd D:\workspace\atk_yolov8_seg_cam_v4
+python tools\receive_detection_events.py --port 5010
+```
+
+然后在板端的既有启动命令末尾追加（默认值也可省略）：
+
+```bash
+--event-push=on --event-udp-port=5010 \
+--event-min-confidence=0.35 --event-heartbeat-ms=1000
+```
+
+PC 默认文字输出为“`2个人出现`”“`当前检测到1辆车`”“`人员离开`”，不显示置信度；`--json`
+保留 `present_mask`、`entered_mask`、`exited_mask`、四类实例数和每类最高置信度，可用于上层
+告警程序。放行 Windows 入站 UDP `5010`。每个 ROEV/1 数据报固定 `44 B`，按照当前
+以太网线速计费为 `110 B`；它和 H.265、RB/1、RSNP 一起使用视频侧剩余额度（音频启用时先
+扣除音频预留）。稳定目标默认仅约 `0.88 kbps` 的每秒心跳，不会为每个视频 RTP 分片重复付费。
+完整字节布局、CRC 和丢包语义见 [协议.md](协议.md#9-roev1-四类检测事件推送)。
+
 ## `rebuild`：100 kbps 语义辅助重建档
 
 `rebuild` 不是把 640×360 视频直接压到 100 kbps，也不是把普通超分结果冒充源视频。
@@ -133,8 +167,8 @@ flowchart LR
     ROISR --> OUT["640x360@12 rebuild HUD"]
 ```
 
-H.265、RB/1 状态和 RB/1 参考分片使用同一个视频侧 `RatePacer`，音频启用时先从
-100 kbps 总额中预留其实际物理包速率，剩余额度才供 H.265 + RB/1 使用。因此 100 kbps
+H.265、RB/1 状态/参考和 ROEV/1 检测事件使用同一个视频侧 `RatePacer`，音频启用时先从
+100 kbps 总额中预留其实际物理包速率，剩余额度才供 H.265 + RB/1 + ROEV/1 使用。因此 100 kbps
 是含以太网/IP/UDP/RTP 开销的 A/V **组合上限**，不是每个端口各 100 kbps。每次处理先发
 当前 STATE，再发送最多两个待传参考数据报；大 JPEG 不再一次占住发送线程并令状态停更。
 参考传输先发 XOR parity、再渐进发送数据分片，完整传输在最后一个数据分片结束，不会因迟到
@@ -306,6 +340,7 @@ flowchart TD
     IQ --> NPU["RKNN YOLOv8-Seg"]
     NPU --> SEG["SegResult\nmask / bbox / PTS"]
     SEG --> FILTER["四类过滤\nperson / car / boat / airplane"]
+    SEG --> EVENT["ROEV/1 事件状态\n变化立即发送 + 1 s 心跳"]
     FILTER -->|视频模式| MAP["RoiMapper\n16x16 BG/HALO/CORE/EDGE QP Map"]
     MAP --> TEMP["RoiManager\n时序平滑和最大年龄控制"]
     TEMP --> MERGE["ROI矩形合并\n最多64个区域"]
@@ -322,6 +357,7 @@ flowchart TD
     JPEG --> SREL["RSNP 可靠分块\nSTART / DATA / ACK / RESUME / END"]
     RTP --> PACER["共享物理双子桶\n音频保留约 10.2 kbps，视频使用剩余\nA/V 合计线速上限 60 / 150 / 300 / rebuild 100 kbps"]
     SREL --> PACER
+    EVENT --> PACER
     MIC["板载麦克风 / 当前新板 card 3"] --> ARECORD["arecord 采集\nhw:3,0 44.1 kHz 双声道"]
     ARECORD --> PCM["下混 + 3.6 kHz 抗混叠重采样\n8 kHz 单声道 PCM"]
     PCM --> ADSP["80 Hz 高通 + 自适应降噪\n语音 VAD + 软门限 + 人声 AGC"]
@@ -336,6 +372,7 @@ flowchart TD
     PACER --> UDP["H.265 UDP socket :5004"]
     PACER --> AUDP["Codec2 UDP socket :5006"]
     PACER --> SUDP["可恢复 JPEG UDP socket :5008"]
+    PACER --> EUDP["ROEV/1 UDP socket :5010"]
     UDP --> NET["网络链路\n随档位切换的 A/V 合计物理线速上限"]
     AUDP --> NET
     SUDP --> NET
@@ -345,6 +382,7 @@ flowchart TD
     DEC --> HUD["BMP自描述帧管道\nOpenCV实时显示 + HUD"]
     NET --> ARX["PC Codec2 RTP 接收器\n解 RTP + c2dec + ffplay"]
     NET --> SRX["PC 图片接收器\n落盘 .jpg.part + RESUME 断点续传"]
+    NET --> ERX["PC 检测事件接收器\nSTATE / 当前存在 / 新出现 / 已离开 / heartbeat"]
 
     SEG -. "仅板端显示" .-> PREVIEW["DSI Preview\nmask / bbox / 标签叠加"]
     RGA -. "MPP 输入 NV12" .-> PREVIEW
@@ -355,7 +393,8 @@ flowchart TD
 `10.2 kbps` 的物理预算；共享限速器为音频和视频分配子桶，视频只使用剩余额度。
 视频遇到 IDR 峰值时仍会优先遵守总上限并按既有策略丢弃过期 P 帧。HUD独占 PC 的 UDP 5004
 端口，不能与 ffplay 或保存脚本同时运行；
-音频接收器独占 UDP 5006，可与任一视频接收器并行运行。
+音频接收器独占 UDP 5006，可与任一视频接收器并行运行。检测事件接收器独占 UDP 5010，
+可与任一视频、音频、图片或 rebuild 接收器并行运行。
 图片模式关闭 MPP/H.265 发送，JPEG 改用视频侧剩余子桶与 UDP 5008；PC 可重启图片接收器，
 它会从 `.jpg.part` 已持久化偏移继续，不需要 SDP。
 
@@ -372,7 +411,7 @@ flowchart TD
 | 1 | `RX 6.0 DEC 6.0 OUT 12.0 fps` | `RX` 是收到的完整 H.265 访问单元/秒；`DEC` 是 FFmpeg 成功解码帧/秒；`OUT` 是 HUD 实际呈现/秒。rebuild 默认应约为 `6/6/12`；`OUT=12` 包含复用帧，并不代表生成了 12 个新源帧。 |
 | 2 | `H265 23.2 RB 19.0 kbps` | 最近 1 秒 H.265 RTP 与 RB/1 伴随通道的应用层码率。H.265 值含 RTP 头，RB 值含 28 B RB/1 头；两者都不含 UDP/IP/以太网开销。 |
 | 3 | `V+RB WIRE 52.7 kbps` | H.265 与 RB/1 合计的估算物理线速，含 UDP/IP、以太网头/FCS、前导码和帧间隔；不含由另一个接收进程统计的音频。 |
-| 4 | `LINK CAP 100 kbps incl audio` | rebuild 档总物理上限；它同时包含视频、RB/1 和可选 Codec2 音频，不是每一路各有 100 kbps。此行是上限，不代表当前一定用满。 |
+| 4 | `LINK CAP 100 kbps incl audio` | rebuild 档总物理上限；它同时包含视频、RB/1、ROEV 事件和可选 Codec2 音频，不是每一路各有 100 kbps。此行是上限，不代表当前一定用满。 |
 | 5 | `P/I 5.0/1.0 total 387/12` | 前半部分是最近 1 秒的 P 帧/I（IDR/CRA）帧率；`total` 后是 HUD 启动以来累计完整 P/I 访问单元数。I 帧应按 GOP 周期出现。 |
 | 6 | `PKT 459 LOSS 0 REO 0 ERR 0` | `PKT` 为累计 H.265 RTP 包数；`LOSS` 由 RTP 序号推断的累计丢包；`REO` 为累计乱序；`ERR` 为 FFmpeg 累计 HEVC 解码错误。局域网通常后三项应为 0。 |
 | 7 | `PPS V 11.0 RB 9.0 S/D/F 6/3/0` | `PPS V/RB` 是最近 1 秒视频 RTP 与全部 RB/1 数据报数，不是帧率。`S/D/F` 依次为 RB/1 `STATE`、`PATCH_DATA`、`PATCH_PARITY` 包率；`S` 通常接近源 fps。 |
@@ -458,6 +497,11 @@ encoded/sent an IDR and a P frame, and exited successfully after `--max-frames=2
 with audio and preview disabled. The previous `jitter` package had separately been
 validated for 180 `rebuild` frames with no sender errors, packet loss, reordering, or
 H.265 decode errors.
+
+> 上述 `20260827` 历史归档早于 ROEV/1 检测事件功能，不能用于本节的 `--event-*` 参数。
+> 使用事件推送前必须按前述 `./build-linux.sh` 从当前源码重新构建并部署；本次仅完成编译验证，
+> 未替换开发板上的历史归档。
+
 Upload and unpack it with:
 
 ```bash
@@ -741,8 +785,9 @@ NumPy, and `ffmpeg.exe` in `PATH`; override the decoder with
 If the sender was already running, wait for its next IDR (at most one GOP; the
 default is 5 seconds at 10 fps) before video appears.  Use native Windows
 `ffplay.exe` for a board-to-PC stream; a WSL receiver can be hidden behind the
-WSL NAT.  Allow inbound UDP 5004 in the Windows firewall (and UDP 5006 when
-audio is enabled) and do not run a second receiver on either occupied port.
+WSL NAT.  Allow inbound UDP 5004 in the Windows firewall (UDP 5006 when audio
+is enabled, and UDP 5010 when the event receiver is used) and do not run a
+second receiver on an occupied port.
 
 To save a run with stock FFmpeg:
 
@@ -914,6 +959,7 @@ cd cpp
 bash tests/build_roi_tests.sh
 python3 -m py_compile ../tools/compare_ab.py
 python3 ../tools/test_receive_codec2_rtp.py
+python3 ../tools/test_detection_event_protocol.py
 ```
 
 These regressions cover source-to-encoder mapping, 16×16 morphology-based
@@ -924,4 +970,6 @@ audio SDP parsing, audio-priority reservation, and stale whole-audio-packet
 dropping. They also cover anti-alias rejection during 44.1 kHz to
 8 kHz conversion, DC/high-pass removal, and the adaptive gate/AGC speech-versus-
 noise behavior.  Board validation still requires the MPP-enabled cross build
-plus an RK3588 run.
+plus an RK3588 run.  The ROEV/1 regression additionally verifies its fixed
+44-byte network-order layout, CRC rejection, four-class mapping, runtime
+parameter validation, and the loopback `STATE → HEARTBEAT → exit` sender path.

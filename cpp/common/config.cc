@@ -38,11 +38,18 @@ RebuildConfig::RebuildConfig()
       patch_chunk_bytes(1100), patch_packets_per_frame(2),
       crop_margin_percent(20), parity(true) {}
 
+DetectionEventConfig::DetectionEventConfig()
+    // A 44-byte ROEV/1 datagram is only emitted on a target-state transition;
+    // while a target remains present, one heartbeat per second lets the PC
+    // recover from a lost UDP edge event without turning every inference into
+    // additional traffic on the shared video-side budget.
+    : enabled(true), udp_port(5010), min_confidence(0.35f), heartbeat_ms(1000) {}
+
 TransportConfig::TransportConfig()
     : udp_host("127.0.0.1"), udp_port(5004), pacing_bitrate_bps(60000),
       mtu(1200), send_queue_frames(3), send_max_latency_ms(250), rtp_sdp_path(""),
       profile_control_path("/tmp/roi-rate-profile"), mode(TRANSPORT_MODE_VIDEO), snapshot(),
-      rebuild() {}
+      rebuild(), event() {}
 
 AudioPreprocessConfig::AudioPreprocessConfig()
     // Voice-first board default.  The ES8388 hard ADC mute gate must stay off:
@@ -327,6 +334,10 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "rebuild-patch-packets-per-frame" && parseInt(value, &integer)) config->transport.rebuild.patch_packets_per_frame = integer;
         else if (key == "rebuild-crop-margin-percent" && parseInt(value, &integer)) config->transport.rebuild.crop_margin_percent = integer;
         else if (key == "rebuild-parity" && parseBool(value, &boolean)) config->transport.rebuild.parity = boolean;
+        else if (key == "event-push" && parseBool(value, &boolean)) config->transport.event.enabled = boolean;
+        else if (key == "event-udp-port" && parseInt(value, &integer)) config->transport.event.udp_port = integer;
+        else if (key == "event-min-confidence" && parseFloat(value, &decimal)) config->transport.event.min_confidence = decimal;
+        else if (key == "event-heartbeat-ms" && parseInt(value, &integer)) config->transport.event.heartbeat_ms = integer;
         else if (key == "audio-udp-port" && parseInt(value, &integer)) config->audio.udp_port = integer;
         else if (key == "audio-capture-rate" && parseInt(value, &integer)) config->audio.capture_rate_hz = integer;
         else if (key == "audio-channels" && parseInt(value, &integer)) config->audio.capture_channels = integer;
@@ -417,6 +428,14 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         config->transport.rebuild.patch_packets_per_frame > 2 ||
         config->transport.rebuild.crop_margin_percent < 0 ||
         config->transport.rebuild.crop_margin_percent > 100 ||
+        config->transport.event.udp_port < 1 || config->transport.event.udp_port > 65535 ||
+        config->transport.event.udp_port == config->transport.udp_port ||
+        config->transport.event.udp_port == config->transport.snapshot.udp_port ||
+        config->transport.event.udp_port == config->transport.rebuild.udp_port ||
+        config->transport.event.min_confidence < 0.0f ||
+        config->transport.event.min_confidence > 1.0f ||
+        config->transport.event.heartbeat_ms < 100 ||
+        config->transport.event.heartbeat_ms > 60000 ||
         config->audio.udp_port < 1 || config->audio.udp_port > 65535 ||
         config->audio.capture_rate_hz < 8000 || config->audio.capture_rate_hz > 192000 ||
         config->audio.capture_channels < 1 || config->audio.capture_channels > 8 ||
@@ -454,7 +473,8 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         (config->audio.enabled && (config->audio.device.empty() ||
                                    config->audio.udp_port == config->transport.udp_port ||
                                    config->audio.udp_port == config->transport.snapshot.udp_port ||
-                                   config->audio.udp_port == config->transport.rebuild.udp_port)) ||
+                                   config->audio.udp_port == config->transport.rebuild.udp_port ||
+                                   config->audio.udp_port == config->transport.event.udp_port)) ||
         (config->transport.mode == TRANSPORT_MODE_IMAGE && config->mode == PIPELINE_BASELINE) ||
         (config->rate_profile == RATE_PROFILE_REBUILD && config->mode == PIPELINE_BASELINE) ||
         config->roi.cell_size != 16 || config->roi.max_regions <= 0 || config->roi.max_age_frames < 0 ||

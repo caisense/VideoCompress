@@ -31,6 +31,7 @@
 #include "transport/h265_sdp.h"
 #include "transport/async_rtp_sender.h"
 #include "transport/codec2_sdp.h"
+#include "transport/detection_event_sender.h"
 #include "transport/rate_pacer.h"
 #include "transport/rebuild_sender.h"
 #include "transport/snapshot_protocol.h"
@@ -118,6 +119,8 @@ void printUsage(const char *program) {
         "          [--rebuild-patch-max-side=128 --rebuild-jpeg-quality=72 --rebuild-patch-max-bytes=1600]\n"
         "          [--rebuild-patch-refresh-ms=700 --rebuild-chunk-bytes=1100 --rebuild-patch-packets-per-frame=2]\n"
         "          [--rebuild-crop-margin-percent=20 --rebuild-parity=on|off]\n"
+        "          [--event-push=on|off --event-udp-port=5010 --event-min-confidence=0.35]\n"
+        "          [--event-heartbeat-ms=1000]\n"
         "          [--preview=on|off --preview-rotate=ccw|none --preview-width=720 --preview-height=1280]\n"
         "          [--debug-roi=on --debug-roi-path=roi_map.pgm]\n", program);
 }
@@ -312,6 +315,19 @@ int main(int argc, char **argv) {
     }
     rebuild_sender.setEnabled(config.transport.mode == TRANSPORT_MODE_VIDEO &&
                               config.rate_profile == RATE_PROFILE_REBUILD);
+    DetectionEventSender event_sender(config.transport.event, config.transport.udp_host,
+                                      config.transport.mtu, video_pacer);
+    if (!event_sender.start(&error)) {
+        std::fprintf(stderr, "detection event UDP initialization failed: %s\n", error.c_str());
+        return EXIT_FAILURE;
+    }
+    event_sender.setEnabled(config.transport.event.enabled);
+    if (config.transport.event.enabled) {
+        std::fprintf(stderr,
+            "Detection event push enabled: person/car/boat/airplane UDP %d, confidence >= %.2f, heartbeat %d ms\n",
+            config.transport.event.udp_port, config.transport.event.min_confidence,
+            config.transport.event.heartbeat_ms);
+    }
     if (config.rate_profile == RATE_PROFILE_REBUILD) {
         std::fprintf(stderr,
             "Rebuild profile enabled: base %dx%d@%d, output %dx%d@%d, semantic/reference UDP %d, combined physical ceiling %d bps\n",
@@ -427,6 +443,16 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 const AppConfig live = runtimeConfig();
+                // Publish semantic events from the raw RKNN result.  ROI/image
+                // filtering may use a different threshold, so it must not hide
+                // a configured event from the independent ROEV/1 channel.
+                std::string event_error;
+                if (!event_sender.submit(result, &event_error)) {
+                    std::fprintf(stderr, "Detection event submit failed: %s\n",
+                                 event_error.c_str());
+                    running.store(false);
+                    break;
+                }
                 const bool rebuild_active =
                     static_cast<TransportMode>(active_transport_mode.load()) ==
                         TRANSPORT_MODE_VIDEO &&
@@ -585,6 +611,12 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (active_transport == TRANSPORT_MODE_IMAGE) {
+                if (event_sender.failed(&encoder_error)) {
+                    std::fprintf(stderr, "Detection event transport error: %s\n",
+                                 encoder_error.c_str());
+                    running.store(false);
+                    break;
+                }
                 if (audio_sender && audio_sender->failed(&encoder_error)) {
                     std::fprintf(stderr, "Codec2 audio transport error: %s\n", encoder_error.c_str());
                     running.store(false);
@@ -609,6 +641,12 @@ int main(int argc, char **argv) {
             }
             if (rebuild_sender.failed(&encoder_error)) {
                 std::fprintf(stderr, "Rebuild transport error: %s\n", encoder_error.c_str());
+                running.store(false);
+                break;
+            }
+            if (event_sender.failed(&encoder_error)) {
+                std::fprintf(stderr, "Detection event transport error: %s\n",
+                             encoder_error.c_str());
                 running.store(false);
                 break;
             }
@@ -675,6 +713,7 @@ int main(int argc, char **argv) {
             const Codec2AudioSenderSnapshot audio_tx = audio_sender
                 ? audio_sender->snapshot() : Codec2AudioSenderSnapshot();
             const RebuildSenderSnapshot rebuild_tx = rebuild_sender.snapshot();
+            const DetectionEventSenderSnapshot event_tx = event_sender.snapshot();
             std::printf("%s tx_bytes=%zu tx_drop_p=%llu tx_drop_idr=%llu tx_wait_idr=%d "
                         "tx_last_frame=%llu tx_send_e2e_us=%llu audio_rtp=%llu audio_frames=%llu "
                         "audio_q=%zu audio_q_age_ms=%llu audio_q_drop=%llu audio_q_drop_frames=%llu "
@@ -684,7 +723,8 @@ int main(int argc, char **argv) {
                         "audio_dtx_drop=%llu audio_dtx_hold=%llu audio_dtx_speech=%llu "
                         "audio_dtx_keepalive=%llu rebuild_state=%llu rebuild_refs=%llu "
                         "rebuild_patch_packets=%llu rebuild_parity=%llu rebuild_jpeg_bytes=%llu "
-                        "rebuild_wire_bytes=%llu rebuild_q=%zu\n",
+                        "rebuild_wire_bytes=%llu rebuild_q=%zu event_packets=%llu event_heartbeat=%llu "
+                        "event_replace=%llu event_wire_bytes=%llu event_mask=0x%04x event_q=%zu\n",
                         statistics.logLine().c_str(), tx.queued_bytes,
                         static_cast<unsigned long long>(tx.dropped_p_frames),
                         static_cast<unsigned long long>(tx.dropped_key_frames),
@@ -716,7 +756,12 @@ int main(int argc, char **argv) {
                         static_cast<unsigned long long>(rebuild_tx.parity_packets),
                         static_cast<unsigned long long>(rebuild_tx.patch_jpeg_bytes),
                         static_cast<unsigned long long>(rebuild_tx.sent_wire_bytes),
-                        rebuild_tx.queued_requests);
+                        rebuild_tx.queued_requests,
+                        static_cast<unsigned long long>(event_tx.state_packets),
+                        static_cast<unsigned long long>(event_tx.heartbeat_packets),
+                        static_cast<unsigned long long>(event_tx.replaced_events),
+                        static_cast<unsigned long long>(event_tx.sent_wire_bytes),
+                        event_tx.last_present_mask, event_tx.queued_events);
             // nohup redirects stdout to a regular file on Buildroot. Flush
             // every status record so tail/grep reflects the live A/V queues
             // rather than a delayed stdio buffer.
@@ -761,6 +806,7 @@ int main(int argc, char **argv) {
     running.store(false);
     if (profile_control_thread.joinable()) profile_control_thread.join();
     if (audio_sender) audio_sender->stop();
+    event_sender.stop();
     rebuild_sender.stop();
     snapshot_sender.stop();
     sender.stop();

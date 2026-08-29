@@ -85,6 +85,18 @@ struct RebuildConfig {
     RebuildConfig();
 };
 
+// Lightweight semantic state notifications are intentionally separate from
+// H.265 RTP, RB/1 and RSNP.  They are emitted on target state transitions and
+// periodic while-present heartbeats, then spend from the shared video pacer.
+struct DetectionEventConfig {
+    bool enabled;
+    int udp_port;
+    float min_confidence;
+    int heartbeat_ms;
+
+    DetectionEventConfig();
+};
+
 struct RoiConfig {
     int cell_size;
     int background_delta_qp;
@@ -139,6 +151,7 @@ struct TransportConfig {
     TransportMode mode;
     SnapshotConfig snapshot;
     RebuildConfig rebuild;
+    DetectionEventConfig event;
 
     TransportConfig();
 };

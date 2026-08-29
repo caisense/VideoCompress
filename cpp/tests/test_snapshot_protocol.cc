@@ -82,7 +82,7 @@ void testCrcAndClassFiltering() {
 void testImageModeConfig() {
     char app[] = "roi_sender";
     char image[] = "--transport-mode=image";
-    char port[] = "--snapshot-udp-port=5010";
+    char port[] = "--snapshot-udp-port=5011";
     char quality[] = "--snapshot-jpeg-quality=91";
     char chunk[] = "--snapshot-chunk-bytes=800";
     char confidence[] = "--snapshot-min-confidence=0.55";
@@ -94,7 +94,7 @@ void testImageModeConfig() {
     std::string error;
     CHECK(roi_h265::parseAppConfig(9, argv, &config, &error));
     CHECK(config.transport.mode == roi_h265::TRANSPORT_MODE_IMAGE);
-    CHECK(config.transport.snapshot.udp_port == 5010);
+    CHECK(config.transport.snapshot.udp_port == 5011);
     CHECK(config.transport.snapshot.jpeg_quality == 91);
     CHECK(config.transport.snapshot.chunk_payload_bytes == 800);
     CHECK(config.transport.snapshot.min_confidence == 0.55f);
