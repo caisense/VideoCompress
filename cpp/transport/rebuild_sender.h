@@ -87,6 +87,7 @@ private:
         uint16_t reference_generation;
         bool has_reference;
         uint64_t last_reference_capture_time_us;
+        uint64_t last_reference_ready_time_us;
 
         Track();
     };

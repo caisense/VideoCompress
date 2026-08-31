@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import dataclasses
 import importlib.util
 import os
 import sys
@@ -97,6 +98,40 @@ class RebuildProtocolTests(unittest.TestCase):
         self.assertEqual(resolver._refresh_active_provider(), "CPUExecutionProvider")
         self.assertEqual(resolver.model_name, "Real-ESRGAN/CPU")
 
+    def test_superresolver_normalizes_dynamic_crops_to_one_model_shape(self):
+        class FakeInput:
+            name = "input"
+            type = "tensor(float)"
+
+        class FakeSession:
+            def __init__(self):
+                self.shapes = []
+
+            @staticmethod
+            def get_inputs():
+                return [FakeInput()]
+
+            @staticmethod
+            def get_providers():
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+            def run(self, _, feeds):
+                tensor = feeds["input"]
+                self.shapes.append(tensor.shape)
+                return [np.zeros((1, 3, 192, 192), dtype=np.float32)]
+
+        resolver = SuperResolver(enabled=False, input_side=96)
+        resolver.session = FakeSession()
+        resolver._ready = True
+        first = resolver.upscale(np.zeros((41, 43, 3), dtype=np.uint8), (86, 82))
+        second = resolver.upscale(np.zeros((48, 53, 3), dtype=np.uint8), (106, 96))
+        larger = resolver.upscale(np.zeros((80, 120, 3), dtype=np.uint8), (240, 160))
+        self.assertEqual(resolver.session.shapes,
+                         [(1, 3, 96, 96), (1, 3, 96, 96), (1, 3, 96, 96)])
+        self.assertEqual(first.shape, (82, 86, 3))
+        self.assertEqual(second.shape, (96, 106, 3))
+        self.assertEqual(larger.shape, (160, 240, 3))
+
     def test_packet_and_state_roundtrip_with_crc_rejection(self):
         target = rb.TargetState(4, 0, 91, 10, 20, 40, 80, 2, 1)
         state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
@@ -135,6 +170,46 @@ class RebuildProtocolTests(unittest.TestCase):
         self.assertEqual(values["data_pps"], 0.0)
         self.assertEqual(values["packet_last_bytes"], len(datagram))
         self.assertEqual(values["packet_avg_bytes"], float(len(datagram)))
+
+    def test_synced_scene_uses_state_generation_when_newer_patch_arrives_early(self):
+        receiver = RebuildReceiver()
+        advertised = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 1),))
+        older = self._visual_reference(reference_generation=2, received_at=10.0)
+        newer = self._visual_reference(reference_generation=3, received_at=10.1)
+        receiver.state_generation = 5
+        receiver.state_history.append((5, 1000, advertised, 10.0))
+        receiver.references[4] = newer
+        receiver.reference_history[(4, 2)] = older
+        receiver.reference_history[(4, 3)] = newer
+
+        selected, generation, references, _, delta = receiver.scene_synced(1000 * 90)
+
+        self.assertEqual(generation, 5)
+        self.assertEqual(selected, advertised)
+        self.assertEqual(delta, 0)
+        self.assertEqual(references[4].reference_generation, 2)
+
+    def test_synced_scene_keeps_old_reference_and_rejects_far_future_reference(self):
+        receiver = RebuildReceiver()
+        advertised = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 1),))
+        receiver.state_generation = 5
+        receiver.state_history.append((5, 1000, advertised, 10.0))
+
+        old_reference = dataclasses.replace(
+            self._visual_reference(), pts_ms=833)
+        receiver.reference_history[(4, 2)] = old_reference
+        _, _, references, _, _ = receiver.scene_synced(1000 * 90)
+        self.assertEqual(references[4], old_reference)
+
+        future_reference = dataclasses.replace(
+            self._visual_reference(), pts_ms=1101)
+        receiver.reference_history[(4, 2)] = future_reference
+        _, _, references, _, _ = receiver.scene_synced(1000 * 90)
+        self.assertEqual(references, {})
 
     def test_protocol_bounds_untrusted_dimensions(self):
         oversized = rb.StateRecord(640, 480, 4096, 4096, 6, 12, 1, ())
@@ -600,6 +675,39 @@ class RebuildProtocolTests(unittest.TestCase):
             self.assertEqual(values["sr_done"], 1)
             self.assertIn((5, 4, 3), composer.cache)
             self.assertNotIn((5, 4, 2), composer.cache)
+        finally:
+            composer.close()
+
+    def test_future_prefetch_waits_until_video_clock_catches_up(self):
+        class FakeResolver:
+            scale = 2
+            available = True
+            model_name = "Fake-SR"
+
+            @staticmethod
+            def upscale(image, target_size):
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        reference = self._visual_reference()
+        composer = RebuildComposer(resolver=FakeResolver())
+        try:
+            composer.update_timing(800 * 90, generation=5, active_track_ids={4})
+            composer.prefetch(reference)
+            values = composer.snapshot()
+            self.assertEqual(values["sr_jobs"], 0)
+            self.assertEqual(values["sr_queue"], 1)
+            self.assertEqual(values["sr_future_waits"], 1)
+            self.assertEqual(values["sr_future_drops"], 0)
+
+            composer.update_timing(900 * 90, generation=5, active_track_ids={4})
+            deadline = time.monotonic() + 1.0
+            while composer.snapshot()["sr_done"] != 1 and time.monotonic() < deadline:
+                composer.prefetch_pending()
+                time.sleep(0.005)
+            values = composer.snapshot()
+            self.assertEqual(values["sr_jobs"], 1)
+            self.assertEqual(values["sr_done"], 1)
+            self.assertEqual(values["sr_queue"], 0)
         finally:
             composer.close()
 

@@ -30,13 +30,13 @@ SnapshotConfig::SnapshotConfig()
 RebuildConfig::RebuildConfig()
     : udp_port(5009), output_width(640), output_height(360), output_fps(12),
       min_confidence(0.35f), max_targets(2), patch_max_side(96),
-      // Refresh is deadline-driven: the soft threshold is used when the
-      // measured transfer fits comfortably, while the hard deadline and
-      // guard pull the next transfer earlier when the shared link is busy.
+      // The soft threshold is also the minimum generation hold time.  A new
+      // reference must survive a later source frame so asynchronous SR can be
+      // consumed without violating same-source-frame immutability.
       // Keep the normal crop close to one MTU-sized RB/1 data packet.  At the
       // rebuild profile's 100 kbps shared ceiling, a two-fragment reference
       // can otherwise consume the H.265 budget and force P-frame recovery.
-      patch_jpeg_quality(50), patch_max_bytes(800), patch_soft_refresh_ms(220),
+      patch_jpeg_quality(50), patch_max_bytes(800), patch_soft_refresh_ms(350),
       patch_hard_deadline_ms(450), patch_refresh_guard_ms(75),
       patch_chunk_bytes(1100), patch_packets_per_frame(2),
       crop_margin_percent(20), parity(true) {}

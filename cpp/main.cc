@@ -117,7 +117,7 @@ void printUsage(const char *program) {
         "          [--rebuild-udp-port=5009 --rebuild-output-width=640 --rebuild-output-height=360]\n"
         "          [--rebuild-output-fps=12 --rebuild-min-confidence=0.35 --rebuild-max-targets=2]\n"
         "          [--rebuild-patch-max-side=96 --rebuild-jpeg-quality=50 --rebuild-patch-max-bytes=800]\n"
-        "          [--rebuild-reference-soft-refresh-ms=220 --rebuild-reference-hard-deadline-ms=450]\n"
+        "          [--rebuild-reference-soft-refresh-ms=350 --rebuild-reference-hard-deadline-ms=450]\n"
         "          [--rebuild-reference-refresh-guard-ms=75 --rebuild-chunk-bytes=1100]\n"
         "          [--rebuild-patch-packets-per-frame=2]\n"
         "          [--rebuild-crop-margin-percent=20 --rebuild-parity=on|off]\n"

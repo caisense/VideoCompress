@@ -526,6 +526,8 @@ def main() -> int:
                         help="small-ROI Real-ESRGAN; auto falls back to Lanczos4")
     parser.add_argument("--esrgan-model", default=None)
     parser.add_argument("--esrgan-threads", type=int, default=2)
+    parser.add_argument("--esrgan-input-side", type=int, default=96,
+                        help="fixed square Real-ESRGAN input used for all rebuild crops")
     parser.add_argument("--rebuild-boxes", choices=("on", "off"), default="off",
                         help="diagnostic target rectangles; off avoids display overlays")
     parser.add_argument("--headless", action="store_true", help="print HUD metrics without opening a window")
@@ -536,7 +538,7 @@ def main() -> int:
             args.rebuild_fps <= 0 or args.rebuild_reference_cache_ttl_ms <= 0 or
             args.rebuild_reference_hard_age_ms <= 0 or
             args.rebuild_reference_future_ms <= 0 or args.rebuild_max_sync_ms <= 0 or
-            args.esrgan_threads < 0):
+            args.esrgan_threads < 0 or args.esrgan_input_side < 16):
         parser.error("dimensions/rates/ages must be positive and scale/threads non-negative")
 
     _, listen_port = parse_sdp(args.sdp)
@@ -555,7 +557,7 @@ def main() -> int:
         reference_future_max_ms=args.rebuild_reference_future_ms)
     resolver = SuperResolver(
         enabled=False, model_path=args.esrgan_model,
-        cpu_threads=args.esrgan_threads)
+        cpu_threads=args.esrgan_threads, input_side=args.esrgan_input_side)
     rebuild_composer = RebuildComposer(
         output_size=(args.rebuild_width, args.rebuild_height), resolver=resolver,
         reference_cache_ttl_ms=args.rebuild_reference_cache_ttl_ms,
@@ -797,7 +799,8 @@ def main() -> int:
                                 f"READY={'LOCAL' if debug_values['refs_used'] else 'BASE'} "
                                 f"MODE={spatial} "
                                 f"MATCH={match_text} "
-                                f"SR={'HIT' if spatial == 'ROI-ESRGAN' else 'MISS'}",
+                                f"SR={'HIT' if spatial == 'ROI-ESRGAN' else 'MISS'} "
+                                f"CACHE={debug_values['last_sr_lookup']}",
                                 flush=True)
                     presentation.present(source_sequence, current_spatial,
                                          profile_generation, now)
@@ -854,8 +857,14 @@ def main() -> int:
                             f"{composer_values['reference_generation']}"
                             f" sr_run={int(composer_values['sr_running'])}"
                             f" sr_q={composer_values['sr_queue']}"
+                            f" sr_done={composer_values['sr_done']}/"
+                            f"{composer_values['sr_jobs']}"
                             f" sr_x={composer_values['sr_x']}"
                             f" sr_stale={composer_values['sr_stale']}"
+                            f" sr_future_wait={composer_values['sr_future_waits']}"
+                            f" sr_invalid={composer_values['sr_invalid_drops']}"
+                            f" sr_ms={composer_values['sr_last_ms']:.0f}/"
+                            f"{composer_values['sr_p95_ms']:.0f}"
                             f" sync_drops={rebuild_values['sync_drops']}"
                             f" fec_recovered={rebuild_values['parity_recovered']}"
                         )
@@ -948,6 +957,10 @@ def main() -> int:
                     f"DONE {composer_values['sr_done']}/{composer_values['sr_jobs']} "
                     f"X {composer_values['sr_x']} "
                     f"STALE {composer_values['sr_stale']}",
+                    f"SRWAIT FUT {composer_values['sr_future_waits']} "
+                    f"INV {composer_values['sr_invalid_drops']} "
+                    f"LAT {composer_values['sr_last_ms']:.0f}/"
+                    f"{composer_values['sr_p95_ms']:.0f} ms",
                 ]
             else:
                 lines = [

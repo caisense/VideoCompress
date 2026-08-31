@@ -7,10 +7,10 @@
 - 参考生命周期拆分为缓存 TTL `1000 ms`、内容硬时效 `450 ms`、future 窗 `100 ms` 和 STATE PTS 窗 `100 ms`。
 - PATCH 在 FEC、CRC、JPEG 和 mask 校验通过后立即成为 PC 侧 `local-ready`，不再等待 ready STATE；STATE 只负责当前轨迹和几何。
 - generation 与 reference_generation 使用单调代次检查；迟到的旧 STATE/PATCH、旧 SR candidate 和旧 SR result 不得覆盖新代次。
-- Real-ESRGAN 保持一个 running 和一个 latest-only pending；提交前、完成后都检查 track、代次、内容年龄和 future 窗。
+- Real-ESRGAN 保持一个 running 和一个 latest-only pending；提交前、完成后都检查 track、代次、内容年龄和 future 窗；所有 ROI 等比填充到固定 `96x96` 模型输入，避免 CUDA 动态形状重复准备。
 - 同一个 H.265 `source_sequence` 只合成一次，并固定该次可用的 SR cache 视图；HOLD tick 复用完全相同的 composed pixels。
 - 保留 bbox EMA、等比面积缩放、matchTemplate 内容配准和稳定的 `(generation, track_id, reference_generation)` SR key。
-- sender 使用软刷新阈值 `220 ms`、硬 deadline `450 ms`、guard `75 ms`，结合参考大小、FEC、共享 RatePacer 和观测 P95 传输时延调度刷新。
+- sender 使用软刷新阈值 `350 ms`、硬 deadline `450 ms`、guard `75 ms`，结合参考大小、FEC、共享 RatePacer 和观测 P95 传输时延调度刷新；软保持从最后一个参考包发出后计时。
 - sender 记录 reference_generation、capture/encode/queue/first-send/last-send 时间、队列等待、采集到最后发送包的延迟、bytes、chunks、FEC 以及 P50/P95；这不是 PC 收包确认时间。
 - rebuild 默认参考参数收敛为长边 `96`、JPEG 质量 `50`、JPEG 本体上限 `800 B`；典型 crop 使用一个 `1100 B` 数据分片，超大参考仍保留 XOR/FEC 路径。
 
@@ -26,15 +26,16 @@
 - 通过 staging 目录解包并原子替换开发板 `/opt/atk/rknn_yolov8_seg_cam`，旧目录保留为带日期的 backup；板端最终目录和二进制可执行，未触碰此前的旧 backup。
 - 当前板端摄像头 `--max-frames=2` smoke 退出码为 `0`；随后使用板端 bus 测试视频跑最终 v4 默认 rebuild `60` 帧，退出码为 `0`，末帧统计为 `rebuild_refs=58`、`rebuild_patch_packets=58`、`rebuild_parity=0`、`rebuild_ref_chunks=1`、`tx_drop_p=0`、`tx_drop_idr=0`，参考 capture→last-send P95 为 `248.46 ms`，错误行计数为 `0`。
 - 独立 PC UDP 计数器在同一板端运行中收到 `5004:24` 个 H.265 RTP 包和 `5009:54` 个 RB/1 包。HUD 实收 `profile=rebuild:256x144@6:g0`，`lost=0`、`reorder=0`、`decode_errors=0`，多帧 `READY=LOCAL MODE=ROI-LANCZOS`，PTS 同步约 `0/-1 ms`，稳定窗口观测约 `65-88 kbps`（100 kbps 组合上限内；启动突发单独统计）。
-- PC 侧 `RealESRGAN_x2_dynamic.onnx` 的真实 CUDA provider/warm-up smoke 已通过；长流实机 HUD 日志出现 `loaded ROI model ... (CUDAExecutionProvider)`，warm-up 约 `4684 ms`，并在模型加载期间继续接收和显示 `ROI-LANCZOS`，`RUN/Q` 均未超过 `1`。由于低带宽流中参考代次持续滚动，本轮没有观察到 `ROI-ESRGAN` 显示命中，但 stale 结果被正确丢弃；不能把该结果表述为实机 SR 命中率验证。
+- 最终根因是 `scene_synced()` 的 future 判定符号写反：本应拒绝 `reference_pts - video_pts > 100 ms` 的未来参考，却错误拒绝了 `video_pts - reference_pts > 100 ms` 的历史参考。6 fps 下每代因此只可用 0/167 ms 两帧，333 ms 第三帧被清空，而异步 SR 恰好在其后才可消费。
+- 修复后重新跑板端 bus 人物视频 120 帧。PC 实收 110 个 source frame（从 SEQ 11 开始），预热前 `ROI-LANCZOS=12`，预热后 `ROI-ESRGAN=98`，`BASE-LANCZOS=0`；其中 32 个年龄 `331-334 ms` 的第三帧均为 ESRGAN。CUDA warm-up `1780 ms`，运行 P95 不超过 `100 ms`，`lost/reorder/decode_errors=0/0/0`。
+- 同段活动窗口 H.265+RB/1 物理速率平均 `57.7 kbps`、峰值 `86.7 kbps`，在 `100 kbps` 组合上限内。板端退出码 `0`，末帧 `rebuild_state=200`、`rebuild_refs=81`、`rebuild_patch_packets=81`、`tx_drop_p=0`、`tx_drop_idr=0`。
 
 ## 验证边界
 
-- Python RB/1 回归：31/31；HUD 回归：12/12；其余 4 个接收/协议脚本
-  共 19/19；Python 语法检查通过。
+- Python 全量回归：66/66；Python 语法检查和 `git diff --check` 通过。
 - C++ 现有测试脚本的 11 个目标全部通过。
 - 本机使用 `model\RealESRGAN_x2_dynamic.onnx` 和
   `CUDAExecutionProvider` 完成真实模型 smoke：`80x48 -> 160x96` 输出通过，后台
-  warm-up 约 `1.8 s`；SR mock、latest-only、过期前拒绝、完成后 stale 和同源帧
-  像素不变测试也已覆盖。
+  warm-up 约 `1.8 s`；SR 固定输入形状、latest-only、future 延迟提交、精确参考代次、
+  历史/未来 PTS 门限、过期前拒绝、完成后 stale 和同源帧像素不变测试均已覆盖。
 - 板端摄像头画面本轮没有产生目标参考，因此参考生命周期的目标场景使用板端 bus 测试视频复验；尚未覆盖真实移动摄像头下的慢速/快速移动、遮挡和重新出现组合。

@@ -26,6 +26,7 @@ REFERENCE_CACHE_TTL_MS = 1000
 REFERENCE_CONTENT_HARD_MAX_AGE_MS = 450
 REFERENCE_FUTURE_MAX_MS = 100
 STATE_SYNC_MAX_MS = 100
+SR_MODEL_INPUT_SIDE = 96
 
 
 def wire_bytes(udp_payload_bytes: int) -> int:
@@ -107,6 +108,11 @@ class RebuildReceiver:
         self.state_history: Deque[Tuple[int, int, rb.StateRecord, float]] = \
             collections.deque(maxlen=32)
         self.references: Dict[int, VisualReference] = {}
+        # Keep the short set of generations that may still be named by a
+        # PTS-synchronised STATE.  The newest PATCH for a track can arrive
+        # before the video frame that advertises it; replacing the sole
+        # per-track entry used to hide the previous, still-required crop.
+        self.reference_history: Dict[Tuple[int, int], VisualReference] = {}
         # A complete PATCH is local-ready immediately.  This floor is kept
         # separately from STATE flags so a late semantic packet cannot make a
         # valid local reference appear unavailable or move its generation back.
@@ -170,6 +176,10 @@ class RebuildReceiver:
             track_id: reference for track_id, reference in self.references.items()
             if reference.received_at >= cutoff
         }
+        self.reference_history = {
+            key: reference for key, reference in self.reference_history.items()
+            if reference.received_at >= cutoff
+        }
         self.completed_reference_events = collections.deque(
             (reference for reference in self.completed_reference_events
              if reference.received_at >= cutoff), maxlen=4)
@@ -225,6 +235,7 @@ class RebuildReceiver:
                     return
                 self.state = None
                 self.references.clear()
+                self.reference_history.clear()
                 self.reference_generations.clear()
                 self.state_reference_generations.clear()
                 self.completed_reference_events.clear()
@@ -350,6 +361,9 @@ class RebuildReceiver:
                 if (decoded_reference.generation == self.state_generation and
                         is_newer_than_local and is_newer_than_existing):
                     self.references[decoded_reference.track_id] = decoded_reference
+                    self.reference_history[(
+                        decoded_reference.track_id,
+                        decoded_reference.reference_generation)] = decoded_reference
                     self.reference_generations[decoded_reference.track_id] = decoded_reference.reference_generation
                     self.completed_reference_events.append(decoded_reference)
                     self.complete_references += 1
@@ -520,7 +534,19 @@ class RebuildReceiver:
                     self._last_sync_drop_timestamp = video_rtp_timestamp
                 return None, generation, {}, selected_updated, selected_delta
             self._last_sync_drop_timestamp = None
-            references = dict(self.references)
+            # Resolve the exact reference generation named by the selected
+            # STATE.  A newer local PATCH may already exist for the same
+            # track, but it belongs to a later source frame and must neither
+            # replace nor suppress this frame's crop.
+            references = {}
+            if selected_state is not None:
+                for target in selected_state.targets:
+                    if target.reference_generation == 0:
+                        continue
+                    reference = self.reference_history.get(
+                        (target.track_id, target.reference_generation))
+                    if reference is not None:
+                        references[target.track_id] = reference
             # Reject only future references here.  The compositor owns the
             # separate content hard-age decision so it can expose AGEDROP
             # instead of silently turning an expired local-ready reference
@@ -529,7 +555,7 @@ class RebuildReceiver:
                 track_id: reference for track_id, reference in references.items()
                 if self._signed_pts_delta(
                     (reference.pts_ms * 90) & 0xFFFFFFFF,
-                    effective_video_rtp_timestamp) >= -self.reference_future_max_ms * 90
+                    effective_video_rtp_timestamp) <= self.reference_future_max_ms * 90
             }
             return (selected_state, generation, references,
                     selected_updated, selected_delta)
@@ -610,9 +636,13 @@ class SuperResolver:
     """Small-ROI Real-ESRGAN; full-frame work always stays Lanczos4."""
 
     def __init__(self, enabled: bool = True, model_path: Optional[str] = None,
-                 cpu_threads: int = 2, scale: int = 2) -> None:
+                 cpu_threads: int = 2, scale: int = 2,
+                 input_side: int = SR_MODEL_INPUT_SIDE) -> None:
+        if input_side < 16 or input_side % max(1, scale) != 0:
+            raise ValueError("SR input side must be >=16 and divisible by scale")
         self.session = None
         self.scale = scale
+        self.input_side = input_side
         self.model_name = "Lanczos4"
         self._active_provider: Optional[str] = None
         self._reported_error = False
@@ -741,15 +771,14 @@ class SuperResolver:
             self.session = ort.InferenceSession(
                 str(model), sess_options=options, providers=providers or None)
             provider = self._refresh_active_provider()
-            # CUDA's first dynamic-shape run can include GPU-context and
-            # kernel initialization that is far slower than steady-state ROI
-            # inference.  Do that work on the asynchronous model-load thread
-            # before marking the resolver usable, rather than spending the
-            # first received reference's 1 s PTS budget on it.  106x128 is the
-            # even-padded form of the typical 105x128 ROI used by this profile.
+            # Keep every rebuild crop on one pre-warmed CUDA shape.  The sender
+            # preserves aspect ratio and its JPEG byte cap changes dimensions
+            # frequently; letting those dimensions reach ORT made each new
+            # shape pay a CUDA setup cost longer than the reference lifetime.
             warmup_started = time.monotonic()
-            warmup = np.zeros((128, 106, 3), dtype=np.uint8)
-            self.upscale(warmup, (212, 256))
+            warmup = np.zeros((self.input_side, self.input_side, 3), dtype=np.uint8)
+            self.upscale(warmup, (self.input_side * self.scale,
+                                  self.input_side * self.scale))
             if self.session is None:
                 return
             self.warmup_ms = (time.monotonic() - warmup_started) * 1000.0
@@ -771,13 +800,22 @@ class SuperResolver:
             return cv2.resize(image, target_size, interpolation=cv2.INTER_LANCZOS4)
         try:
             source_height, source_width = image.shape[:2]
-            multiple = max(1, self.scale)
-            pad_height = (-source_height) % multiple
-            pad_width = (-source_width) % multiple
-            if pad_height or pad_width:
-                image = cv2.copyMakeBorder(image, 0, pad_height, 0, pad_width,
-                                           cv2.BORDER_REPLICATE)
-            input_height, input_width = image.shape[:2]
+            if source_height <= 0 or source_width <= 0:
+                raise ValueError("empty SR input")
+            fit = min(1.0, self.input_side / float(max(source_height, source_width)))
+            content_width = max(1, int(round(source_width * fit)))
+            content_height = max(1, int(round(source_height * fit)))
+            content = image
+            if content_width != source_width or content_height != source_height:
+                content = cv2.resize(
+                    image, (content_width, content_height), interpolation=cv2.INTER_AREA)
+            pad_left = (self.input_side - content_width) // 2
+            pad_right = self.input_side - content_width - pad_left
+            pad_top = (self.input_side - content_height) // 2
+            pad_bottom = self.input_side - content_height - pad_top
+            image = cv2.copyMakeBorder(
+                content, pad_top, pad_bottom, pad_left, pad_right,
+                cv2.BORDER_REPLICATE)
             model_input = self.session.get_inputs()[0]
             dtype = np.float16 if model_input.type == "tensor(float16)" else np.float32
             tensor = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(dtype) / dtype(255.0)
@@ -792,10 +830,13 @@ class SuperResolver:
             output = result[0].transpose(1, 2, 0)
             output = cv2.cvtColor(
                 np.clip(output * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            if pad_height or pad_width:
-                crop_height = int(round(output.shape[0] * source_height / input_height))
-                crop_width = int(round(output.shape[1] * source_width / input_width))
-                output = output[:crop_height, :crop_width]
+            output_scale_x = output.shape[1] / float(self.input_side)
+            output_scale_y = output.shape[0] / float(self.input_side)
+            crop_left = int(round(pad_left * output_scale_x))
+            crop_top = int(round(pad_top * output_scale_y))
+            crop_right = int(round((pad_left + content_width) * output_scale_x))
+            crop_bottom = int(round((pad_top + content_height) * output_scale_y))
+            output = output[crop_top:crop_bottom, crop_left:crop_right]
             if output.shape[1] != target_size[0] or output.shape[0] != target_size[1]:
                 output = cv2.resize(output, target_size, interpolation=cv2.INTER_LANCZOS4)
             return output
@@ -847,8 +888,14 @@ class RebuildComposer:
         self.sr_expired_before_submit = 0
         self.sr_expired_after_compute = 0
         self.sr_future_drops = 0
+        self.sr_future_waits = 0
         self.sr_invalid_drops = 0
         self.sr_pending_replaced = 0
+        self.sr_cache_hits = 0
+        self.sr_cache_misses = 0
+        self.last_sr_lookup = "none"
+        self.sr_last_ms = 0.0
+        self.sr_compute_samples_ms: Deque[float] = collections.deque(maxlen=64)
         self.registration_drops = 0
         self.content_drops = 0
         self.content_matches = 0
@@ -916,7 +963,9 @@ class RebuildComposer:
             effective_video, (reference.pts_ms * 90) & 0xFFFFFFFF)
         return int(round(age_ticks / 90.0))
 
-    def _reference_gate_reason(self, reference: VisualReference) -> Optional[str]:
+    def _reference_gate_reason(self, reference: VisualReference,
+                               allow_newer_than_advertised: bool = False
+                               ) -> Optional[str]:
         if (self._latest_generation is not None and
                 reference.generation != self._latest_generation):
             return "generation"
@@ -932,7 +981,10 @@ class RebuildComposer:
             return "stale-reference"
         advertised = self._advertised_reference_generations.get(reference.track_id, 0)
         if advertised and reference.reference_generation != advertised:
-            return "advertised-reference"
+            if (not allow_newer_than_advertised or
+                    not RebuildReceiver._newer_u16(
+                        reference.reference_generation, advertised)):
+                return "advertised-reference"
         age_ms = self._content_age_ms(reference)
         if age_ms is None:
             return "clock"
@@ -965,9 +1017,15 @@ class RebuildComposer:
         self.job_key = key
         self.job_reference = reference
         self.future = self.executor.submit(
-            self.resolver.upscale, reference.image.copy(), native_size)
+            self._run_sr, reference.image.copy(), native_size)
         self.sr_jobs += 1
         return True
+
+    def _run_sr(self, image: np.ndarray,
+                native_size: Tuple[int, int]) -> Tuple[np.ndarray, float]:
+        started = time.monotonic()
+        output = self.resolver.upscale(image, native_size)
+        return output, (time.monotonic() - started) * 1000.0
 
     def _defer_latest(self, reference: VisualReference) -> None:
         """Keep at most one not-yet-submitted crop, preferring the newest."""
@@ -975,6 +1033,8 @@ class RebuildComposer:
             self.pending_reference = reference
             return
         pending = self.pending_reference
+        if self._reference_key(reference) == self._reference_key(pending):
+            return
         if reference.received_at >= pending.received_at:
             self.pending_reference = reference
             self.sr_pending_replaced += 1
@@ -987,8 +1047,9 @@ class RebuildComposer:
         if key in self.cache:
             self.pending_reference = None
             return
-        reason = self._reference_gate_reason(reference)
-        if reason == "clock":
+        reason = self._reference_gate_reason(
+            reference, allow_newer_than_advertised=True)
+        if reason in ("clock", "future"):
             return
         if reason is not None:
             self.pending_reference = None
@@ -1019,8 +1080,15 @@ class RebuildComposer:
             # immediate display path; the candidate can use SR once ready.
             self._defer_latest(reference)
             return
-        reason = self._reference_gate_reason(reference)
+        reason = self._reference_gate_reason(
+            reference, allow_newer_than_advertised=True)
         if reason == "clock":
+            self._defer_latest(reference)
+            return
+        if reason == "future":
+            if (self.pending_reference is None or
+                    self._reference_key(self.pending_reference) != key):
+                self.sr_future_waits += 1
             self._defer_latest(reference)
             return
         if reason is not None:
@@ -1045,7 +1113,9 @@ class RebuildComposer:
         reference = self.job_reference
         self.job_reference = None
         try:
-            image = future.result()
+            image, compute_ms = future.result()
+            self.sr_last_ms = compute_ms
+            self.sr_compute_samples_ms.append(compute_ms)
         except Exception:
             self.sr_stale += 1
             self._start_deferred()
@@ -1059,7 +1129,8 @@ class RebuildComposer:
         if reference is None:
             self.sr_stale += 1
         else:
-            reason = self._reference_gate_reason(reference)
+            reason = self._reference_gate_reason(
+                reference, allow_newer_than_advertised=True)
             if reason is not None:
                 self.sr_stale += 1
                 self._record_sr_rejection(reason, before_submit=False)
@@ -1087,6 +1158,16 @@ class RebuildComposer:
         native = (self.cache.get(key) if cache_keys is None or key in cache_keys
                   else None)
         enhanced = native is not None and self.resolver.available
+        cache_view = self.cache if cache_keys is None else cache_keys
+        if enhanced:
+            self.sr_cache_hits += 1
+        else:
+            self.sr_cache_misses += 1
+        cached = ",".join(
+            f"{cached_key[1]}/{cached_key[2]}" for cached_key in cache_view)
+        self.last_sr_lookup = (
+            f"{key[1]}/{key[2]}:{'hit' if enhanced else 'miss'}"
+            f"[{cached or '-'}]")
         if native is not None:
             patch = cv2.resize(native, size, interpolation=cv2.INTER_LANCZOS4)
         else:
@@ -1442,6 +1523,9 @@ class RebuildComposer:
         return canvas, self.last_spatial
 
     def snapshot(self) -> dict:
+        sorted_sr_ms = sorted(self.sr_compute_samples_ms)
+        sr_p95_ms = (sorted_sr_ms[max(0, math.ceil(len(sorted_sr_ms) * 0.95) - 1)]
+                     if sorted_sr_ms else 0.0)
         return {
             "spatial": self.last_spatial,
             "refs_used": self.last_refs_used,
@@ -1468,7 +1552,14 @@ class RebuildComposer:
             "sr_x": self.sr_expired_before_submit,
             "sr_expired_after_compute": self.sr_expired_after_compute,
             "sr_future_drops": self.sr_future_drops,
+            "sr_future_waits": self.sr_future_waits,
+            "sr_invalid_drops": self.sr_invalid_drops,
             "sr_pending_replaced": self.sr_pending_replaced,
+            "sr_cache_hits": self.sr_cache_hits,
+            "sr_cache_misses": self.sr_cache_misses,
+            "last_sr_lookup": self.last_sr_lookup,
+            "sr_last_ms": self.sr_last_ms,
+            "sr_p95_ms": sr_p95_ms,
             "registration_drops": self.registration_drops,
             "content_drops": self.content_drops,
             "content_matches": self.content_matches,

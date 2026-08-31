@@ -97,7 +97,8 @@ RebuildSenderSnapshot::RebuildSenderSnapshot()
 
 RebuildSender::Track::Track()
     : id(0), class_id(-1), confidence(0.0f), last_seen_frame(0),
-      reference_generation(0), has_reference(false), last_reference_capture_time_us(0) {}
+      reference_generation(0), has_reference(false), last_reference_capture_time_us(0),
+      last_reference_ready_time_us(0) {}
 
 RebuildSender::RebuildSender(const RebuildConfig &config, const std::string &host, int mtu,
                              const std::shared_ptr<RatePacer> &pacer)
@@ -534,15 +535,13 @@ int RebuildSender::referenceRefreshThresholdMs() const {
     const int delivery_ms = estimatedReferenceDeliveryMs();
     const int deadline_start = std::max(0, config_.patch_hard_deadline_ms -
         config_.patch_refresh_guard_ms - delivery_ms);
-    if (deadline_start == 0) {
-        // An estimate beyond the hard window cannot be made timely by
-        // retrying every source frame.  Keep the soft cadence instead of
-        // flooding the shared pacer and starving H.265.
-        return config_.patch_soft_refresh_ms;
-    }
-    // A measured/estimated transfer that is close to the hard deadline pulls
-    // the refresh forward.  A short transfer still obeys the soft cadence.
-    return std::min(config_.patch_soft_refresh_ms, deadline_start);
+    // The soft cadence is a lower bound, not a target that the delivery
+    // estimate may shorten.  At 6 fps, pulling 350 ms down to one 167 ms frame
+    // published a new reference_generation before an asynchronous SR result
+    // was eligible on the next immutable source frame.  Fast transfers may
+    // wait until the latest safe deadline start; slow transfers retain the
+    // minimum hold instead of creating an unusable per-frame generation.
+    return std::max(config_.patch_soft_refresh_ms, deadline_start);
 }
 
 bool RebuildSender::beginReference(const Request &request, const ActiveTarget &active,
@@ -638,6 +637,8 @@ bool RebuildSender::sendPendingReferencePacket(std::string *error) {
         tracks_[index].has_reference = true;
         tracks_[index].last_reference_capture_time_us =
             pending_reference_.capture_time_us;
+        tracks_[index].last_reference_ready_time_us =
+            pending_reference_.last_packet_send_time_us;
         break;
     }
     const uint64_t capture_to_send_us =
@@ -722,9 +723,8 @@ bool RebuildSender::process(const Request &request, std::string *error) {
     }
     if (active.empty()) return true;
     // References are intentionally paced on the same physical token bucket
-    // as H.265.  Start the next transfer at the earlier of the configured soft
-    // cadence and the estimated hard-deadline start, so a large reference
-    // cannot spend its whole valid content lifetime waiting in the queue.
+    // as H.265.  Keep each generation for at least the soft interval, then use
+    // the estimated hard-deadline start to avoid needless early refreshes.
     const uint64_t now_us = steadyNowMicros();
     const int refresh_threshold_ms = referenceRefreshThresholdMs();
     size_t selected = active.size();
@@ -735,9 +735,14 @@ bool RebuildSender::process(const Request &request, std::string *error) {
             selected = index;
             break;
         }
-        const uint64_t age_ms = track.last_reference_capture_time_us > 0 &&
-            now_us >= track.last_reference_capture_time_us
-            ? (now_us - track.last_reference_capture_time_us) / 1000U : 0U;
+        // The soft hold starts when the crop becomes available on the wire,
+        // not when its source frame was captured.  RKNN, JPEG, and paced UDP
+        // delivery can consume most of the hold before the receiver has
+        // any pixels; capture PTS remains the independent hard content-age
+        // clock carried by the protocol.
+        const uint64_t age_ms = track.last_reference_ready_time_us > 0 &&
+            now_us >= track.last_reference_ready_time_us
+            ? (now_us - track.last_reference_ready_time_us) / 1000U : 0U;
         if (age_ms >= static_cast<uint64_t>(refresh_threshold_ms) &&
             (selected == active.size() ||
              age_ms > oldest_age_ms)) {

@@ -303,7 +303,7 @@ void testCommandLineConfig() {
     CHECK(rebuild.transport.rebuild.patch_max_side == 96);
     CHECK(rebuild.transport.rebuild.patch_jpeg_quality == 50);
     CHECK(rebuild.transport.rebuild.patch_max_bytes == 800);
-    CHECK(rebuild.transport.rebuild.patch_soft_refresh_ms == 220);
+    CHECK(rebuild.transport.rebuild.patch_soft_refresh_ms == 350);
     CHECK(rebuild.transport.rebuild.patch_hard_deadline_ms == 450);
     CHECK(rebuild.transport.rebuild.patch_refresh_guard_ms == 75);
     CHECK(!rebuild.encoder.grayscale_encode);
