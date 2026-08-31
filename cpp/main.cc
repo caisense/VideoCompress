@@ -733,8 +733,17 @@ int main(int argc, char **argv) {
                         "rebuild_ref_queue_us=%llu rebuild_ref_first_send_us=%llu "
                         "rebuild_ref_last_send_us=%llu rebuild_ref_q_delay_us=%llu "
                         "rebuild_ref_capture_send_us=%llu rebuild_ref_capture_p50_us=%llu "
-                        "rebuild_ref_capture_p95_us=%llu rebuild_ref_bytes=%llu "
+                        "rebuild_ref_capture_p95_us=%llu "
+                        "rebuild_ref_delivery_us=%llu rebuild_ref_delivery_p50_us=%llu "
+                        "rebuild_ref_delivery_p95_us=%llu rebuild_ref_bytes=%llu "
                         "rebuild_ref_chunks=%llu rebuild_ref_fec_bytes=%llu "
+                        "rebuild_ref_interval_us=%llu rebuild_ref_interval_p50_us=%llu "
+                        "rebuild_ref_interval_p95_us=%llu rebuild_ref_interval_max_us=%llu "
+                        "rebuild_refresh_track=%u rebuild_ref_capture_age_ms=%d "
+                        "rebuild_ref_ready_age_ms=%d rebuild_refresh_threshold_ms=%d "
+                        "rebuild_est_delivery_ms=%d rebuild_next_deadline_ms=%d "
+                        "rebuild_refresh_quantum_ms=%d rebuild_refresh_decision=%s "
+                        "rebuild_refresh_reason=%s "
                         "event_packets=%llu event_heartbeat=%llu "
                         "event_replace=%llu event_wire_bytes=%llu event_mask=0x%04x event_q=%zu\n",
                         statistics.logLine().c_str(), tx.queued_bytes,
@@ -779,9 +788,25 @@ int main(int argc, char **argv) {
                         static_cast<unsigned long long>(rebuild_tx.last_reference_capture_to_send_us),
                         static_cast<unsigned long long>(rebuild_tx.reference_capture_to_send_p50_us),
                         static_cast<unsigned long long>(rebuild_tx.reference_capture_to_send_p95_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_delivery_us),
+                        static_cast<unsigned long long>(rebuild_tx.reference_delivery_p50_us),
+                        static_cast<unsigned long long>(rebuild_tx.reference_delivery_p95_us),
                         static_cast<unsigned long long>(rebuild_tx.last_reference_blob_bytes),
                         static_cast<unsigned long long>(rebuild_tx.last_reference_chunk_count),
                         static_cast<unsigned long long>(rebuild_tx.last_reference_fec_bytes),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_interval_us),
+                        static_cast<unsigned long long>(rebuild_tx.reference_interval_p50_us),
+                        static_cast<unsigned long long>(rebuild_tx.reference_interval_p95_us),
+                        static_cast<unsigned long long>(rebuild_tx.reference_interval_max_us),
+                        static_cast<unsigned int>(rebuild_tx.last_refresh_track_id),
+                        rebuild_tx.last_reference_capture_age_ms,
+                        rebuild_tx.last_reference_ready_age_ms,
+                        rebuild_tx.last_refresh_threshold_ms,
+                        rebuild_tx.last_estimated_delivery_ms,
+                        rebuild_tx.last_refresh_deadline_ms,
+                        rebuild_tx.last_refresh_quantum_ms,
+                        rebuild_tx.last_refresh_decision_start ? "START" : "HOLD",
+                        rebuild_tx.last_refresh_reason.c_str(),
                         static_cast<unsigned long long>(event_tx.state_packets),
                         static_cast<unsigned long long>(event_tx.heartbeat_packets),
                         static_cast<unsigned long long>(event_tx.replaced_events),

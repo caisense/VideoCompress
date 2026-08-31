@@ -796,10 +796,23 @@ def main() -> int:
                                 f"AGE={'none' if debug_values['reference_content_age_ms'] is None else debug_values['reference_content_age_ms']} "
                                 f"GEN={profile_generation} "
                                 f"RGEN={'none' if debug_values['reference_generation'] is None else debug_values['reference_generation']} "
-                                f"READY={'LOCAL' if debug_values['refs_used'] else 'BASE'} "
+                                f"REFREADY={debug_values['reference_ready']} "
+                                f"USED={debug_values['refs_used']} "
                                 f"MODE={spatial} "
+                                f"DROP={debug_values['last_drop_reason']} "
+                                f"DROP_REASON={debug_values['last_drop_reason']} "
                                 f"MATCH={match_text} "
+                                f"DXR={debug_values['geom_dx_ratio']:.2f} "
+                                f"DYR={debug_values['geom_dy_ratio']:.2f} "
+                                f"AR={debug_values['geom_area_ratio']:.2f} "
+                                f"GEOM_DX_RATIO={debug_values['geom_dx_ratio']:.2f} "
+                                f"GEOM_DY_RATIO={debug_values['geom_dy_ratio']:.2f} "
+                                f"AREA_RATIO={debug_values['geom_area_ratio']:.2f} "
                                 f"SR={'HIT' if spatial == 'ROI-ESRGAN' else 'MISS'} "
+                                f"SRSTATE={debug_values['sr_state']} "
+                                f"SR_STATE={debug_values['sr_state']} "
+                                f"SRLOOKUP={debug_values['last_sr_lookup']} "
+                                f"SR_LOOKUP={debug_values['last_sr_lookup']} "
                                 f"CACHE={debug_values['last_sr_lookup']}",
                                 flush=True)
                     presentation.present(source_sequence, current_spatial,
@@ -845,9 +858,18 @@ def main() -> int:
                             f" rb_pkt_avg_B={rebuild_values['packet_avg_bytes']:.0f}"
                             f" refs={composer_values['refs_used']}/"
                             f"{rebuild_values['active_references']}"
+                            f" refready={composer_values['reference_ready']}"
                             f" agedrop={composer_values['age_drops']}"
-                            f" reg_drops={composer_values['registration_drops']}"
-                            f" content_drops={composer_values['content_drops']}"
+                            f" futuredrop={composer_values['future_drops']}"
+                            f" norefdrop={composer_values['no_reference_drops']}"
+                            f" statedrop={composer_values['state_drops']}"
+                            f" gendrop={composer_values['generation_drops']}"
+                            f" geomdrop={composer_values['registration_drops']}"
+                            f" geominvalid={composer_values['geom_invalid_drops']}"
+                            f" geomscale={composer_values['geom_scale_drops']}"
+                            f" scaledrop={composer_values['geom_scale_drops']}"
+                            f" geomoutside={composer_values['geom_outside_drops']}"
+                            f" matchdrop={composer_values['content_drops']}"
                             f" rebuild_area={composer_values['rebuild_percent']:.1f}%"
                             f" chroma={composer_values['chroma_mode']}"
                             f" pts_sync_ms={'none' if sync_ms is None else sync_ms}"
@@ -864,7 +886,10 @@ def main() -> int:
                             f" sr_future_wait={composer_values['sr_future_waits']}"
                             f" sr_invalid={composer_values['sr_invalid_drops']}"
                             f" sr_ms={composer_values['sr_last_ms']:.0f}/"
+                            f"{composer_values['sr_p50_ms']:.0f}/"
                             f"{composer_values['sr_p95_ms']:.0f}"
+                            f" sr_first={composer_values['new_reference_first_frame_sr_hits']}/"
+                            f"{composer_values['new_reference_first_frames']}"
                             f" sync_drops={rebuild_values['sync_drops']}"
                             f" fec_recovered={rebuild_values['parity_recovered']}"
                         )
@@ -934,18 +959,23 @@ def main() -> int:
                     f"FRAME {presentation_values['provenance']}",
                     f"TEMP HOLD {presentation_values['held_percent']:.1f}% "
                     f"({profile['fps']}->{output_fps})",
-                    f"REF {composer_values['refs_used']}/"
-                    f"{rebuild_values['active_references']} AGE {ref_age_text} "
-                    f"PTSAGE {ref_pts_age_text} "
-                    f"AGEDROP {composer_values['age_drops']} "
-                    f"REGDROP {composer_values['registration_drops']} "
-                    f"MATCHDROP {composer_values['content_drops']}",
-                    f"ROI AREA {composer_values['rebuild_percent']:.1f}%",
-                    f"GEN {profile['generation']}/{composer_values['reference_generation']} "
-                    f"FUTURE {composer_values['future_drops']} "
-                    f"TIMINGDROP {composer_values['timing_drops']}",
-                    f"PTS SYNC {sync_text} BIAS {rebuild_values['pts_bias_ms']:+d}ms "
-                    f"DROP#{rebuild_values['sync_drops']}",
+                            f"REFREADY {composer_values['reference_ready']} USED "
+                            f"{composer_values['refs_used']}/"
+                            f"{rebuild_values['active_references']} AGE {ref_age_text} "
+                            f"PTSAGE {ref_pts_age_text}",
+                            f"ROI AREA {composer_values['rebuild_percent']:.1f}%",
+                            f"AGEDROP {composer_values['age_drops']} "
+                            f"FUTUREDROP {composer_values['future_drops']} "
+                            f"NOREFDROP {composer_values['no_reference_drops']}",
+                            f"STATEDROP {composer_values['state_drops']} "
+                            f"GENDROP {composer_values['generation_drops']} "
+                            f"GEOMDROP {composer_values['registration_drops']}",
+                            f"SCALEDROP {composer_values['geom_scale_drops']} "
+                            f"MATCHDROP {composer_values['content_drops']} "
+                            f"DROP_REASON {composer_values['last_drop_reason']}",
+                            f"PTS SYNC {sync_text} BIAS {rebuild_values['pts_bias_ms']:+d}ms "
+                            f"DROP#{rebuild_values['sync_drops']} "
+                            f"TIMINGDROP {composer_values['timing_drops']}",
                     f"CHROMA {composer_values['chroma_mode']} "
                     f"BOX {args.rebuild_boxes.upper()}",
                     f"FEC {rebuild_values['parity_recovered']} "
@@ -956,10 +986,14 @@ def main() -> int:
                     f"Q {composer_values['sr_queue']} "
                     f"DONE {composer_values['sr_done']}/{composer_values['sr_jobs']} "
                     f"X {composer_values['sr_x']} "
-                    f"STALE {composer_values['sr_stale']}",
+                    f"STALE {composer_values['sr_stale']} "
+                    f"FIRST {composer_values['new_reference_first_frame_sr_hits']}/"
+                    f"{composer_values['new_reference_first_frames']} "
+                    f"STATE {composer_values['sr_state']}",
                     f"SRWAIT FUT {composer_values['sr_future_waits']} "
                     f"INV {composer_values['sr_invalid_drops']} "
                     f"LAT {composer_values['sr_last_ms']:.0f}/"
+                    f"{composer_values['sr_p50_ms']:.0f}/"
                     f"{composer_values['sr_p95_ms']:.0f} ms",
                 ]
             else:

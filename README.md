@@ -175,9 +175,11 @@ H.265、RB/1 状态/参考和 ROEV/1 检测事件使用同一个视频侧 `RateP
 parity 产生伪未完成任务。参考图只保留最新任务，默认长边不超过 96、JPEG 质量 50、JPEG
 最大 800 B、1100 B 分片、每源帧最多 2 个分片；这一组合让通常的 rebuild crop 落在一个数据分片内，
 超大参考仍由 XOR/FEC 保护。参考刷新不是固定周期：默认软阈值为 `350 ms`、
-硬时限为 `450 ms`、保护提前量为 `75 ms`，发送端按参考大小、FEC、共享令牌桶和已观测 P95
-传输耗时计算下一次启动时刻；软保持时间从最后一个参考包发出后开始，避免 RKNN/JPEG/排队耗时提前消耗代次寿命。
-多个目标按最老参考优先错开。一个 XOR 校验分片可恢复任意一个丢失数据分片。
+硬时限为 `450 ms`、保护提前量为 `75 ms`。发送端以 `last_reference_capture_time_us` 为内容年龄
+基准，结合参考大小、FEC、共享令牌桶和观测到的纯发送 P95 估算下一次 deadline opportunity；
+`350 ms` 是 cadence hint，不是从最后一个包发出后重新计时的最小保持时间。在 6 fps 下调度量化到
+约 `167 ms`，正常参考会在约 `334 ms` 的采集年龄启动，慢发送会更早启动，且仍由共享 RatePacer
+约束长期物理速率。多个目标按最老参考优先错开。一个 XOR 校验分片可恢复任意一个丢失数据分片。
 每个 RB/1 包都带源 PTS、帧号、档位代次和 CRC32。
 
 接收端先用**有界 FIFO**把完整 RTP 访问单元按解码顺序交给 BMP 输出，再以最近状态的滑动中位数估计固定 PTS
@@ -188,16 +190,19 @@ parity 产生伪未完成任务。参考图只保留最新任务，默认长边�
 STATE 只负责当前轨迹与几何，非零 `reference_generation` 仍须严格匹配。
 如果基础层被检测为中性灰度，参考块也先转为灰度再融合，避免出现“彩色目标悬浮在灰色背景”现象。
 参考分片额外携带参考时刻的 detector bbox，接收端先对当前框做 EMA，再按参考框到当前框的等比平移/缩放关系放置 crop；
-随后在预测位置 ±8 px 内做内容相关配准，用峰值相关度作 fail-closed 闸门。中心位移超过 25% 或面积比超出 `[0.70,1.40]` 时拒绝贴图。
+随后在预测位置 ±8 px 内做内容相关配准，用峰值相关度作 fail-closed 闸门。检测框正常平移不再因
+“中心位移超过 25%”被误拒；无效几何、极端宽高/尺度变化、完全越界或内容相关度不足时仍拒绝贴图，
+默认面积比保护范围为 `[0.70,1.40]`。
 掩码核心区 alpha=1、边缘羽化半径随 64×64 掩码放大倍率自适应，
 没有有效分割掩码时只使用 detector bbox，避免把 crop 边缘背景误贴到当前画面。
 因此 RB/1 PATCH 的重复元数据为 40 B（原 32 B 元数据后增加 8 B reference bbox），
 mask 采样为 64×64；发送端和 PC 接收端必须使用同一版本。
 12 fps 默认由 6 fps 解码帧交替显示新帧和 `HOLD` 帧，不使用会产生双影的线性插帧；所以它
 提高显示刷新稳定性，不会伪造额外运动细节。HUD 会明确显示 `DECODED`/`HOLD`、空间处理来源、
-HOLD 比例、`ROI AREA`、校准后 `PTS SYNC` 与 `BIAS`、参考 `PTSAGE`/墙钟年龄、`REGDROP`/`MATCHDROP`、
-`CHROMA`、RB/1 码率、XOR 恢复数、`AGEDROP/FUTURE/TIMINGDROP` 和 SR 的
-`RUN/Q/DONE/X/STALE`。
+HOLD 比例、`ROI AREA`、校准后 `PTS SYNC` 与 `BIAS`、参考 `PTSAGE`/墙钟年龄、`REFREADY/USED`、
+`DROP_REASON`、`REGDROP`/`MATCHDROP`/`SCALEDROP`、`GEOM_DX_RATIO/GEOM_DY_RATIO/AREA_RATIO`、`CHROMA`、RB/1 码率、
+XOR 恢复数、`AGEDROP/FUTUREDROP/NOREFDROP/STATEDROP/GENDROP/GEOMDROP/SCALEDROP/MATCHDROP/TIMINGDROP` 和
+SR 的 `SR_LOOKUP/SR_STATE/RUN/Q/DONE/X/STALE/CACHE`。
 
 Real-ESRGAN 只在 Windows PC 上处理小 ROI，RK3588 部署包不需要 ONNX Runtime。当前
 PC 有 NVIDIA GPU 时，优先安装 CUDA 档；CPU 档仅作为无 NVIDIA GPU 时的回退。两种 ONNX Runtime
@@ -509,6 +514,23 @@ H.265 decode errors.
 > 上述 `20260827` 历史归档早于 ROEV/1 检测事件功能，不能用于本节的 `--event-*` 参数。
 > 使用事件推送前必须按前述 `./build-linux.sh` 从当前源码重新构建并部署；本次仅完成编译验证，
 > 未替换开发板上的历史归档。
+
+### goal0831 最终验收（2026-08-31）
+
+针对 `debug.txt` 中 389 个源帧的基线，当前版本同时修复了采集时间刷新调度、移动目标几何放行和
+Real-ESRGAN 计算/显示门控。Ubuntu `192.168.0.10` 交叉编译产生的最终包为
+`runs\goal0831_rk3588_final.tar.gz`，SHA-256 为
+`638252aa3269e3d404811fa37cc0d145bbc7d0a1e123206847b6cd645c3e6f77`；板端二进制 SHA-256 为
+`8765b468592f3c5805e18ffddd1bc653bd923ee7b9801da7d51153ca2ddce05e`，部署目录为
+`/opt/atk/rknn_yolov8_seg_cam`，旧目录保留在
+`/opt/atk/rknn_yolov8_seg_cam.backup.goal0831_telemetry_20260831`。
+
+板端使用同一 bus 人物视频运行 `180` 帧约 30 秒并正常退出；PC HUD 收到连续活动窗口的 `164` 个
+source frame：`ROI-LANCZOS=88`、`ROI-ESRGAN=76`、`BASE-LANCZOS=0`，`REFREADY=164/164`、
+`USED=164/164`，`AGEDROP/FUTUREDROP/NOREFDROP/STATEDROP/GENDROP/GEOMDROP/MATCHDROP=0`，
+`lost/reorder/decode_errors=0/0/0`。参考刷新间隔为 `p50=334 ms`、`p95=335 ms`、最大 `337 ms`；
+SR 实测完成延迟约 `p50=90 ms`、`p95=102 ms`。最终板端和接收端日志分别保存在
+`runs\goal0831_sender_final.log` 与 `runs\goal0831_receiver_final.log`。
 
 Upload and unpack it with:
 

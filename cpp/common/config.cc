@@ -30,9 +30,9 @@ SnapshotConfig::SnapshotConfig()
 RebuildConfig::RebuildConfig()
     : udp_port(5009), output_width(640), output_height(360), output_fps(12),
       min_confidence(0.35f), max_targets(2), patch_max_side(96),
-      // The soft threshold is also the minimum generation hold time.  A new
-      // reference must survive a later source frame so asynchronous SR can be
-      // consumed without violating same-source-frame immutability.
+      // The soft value is a capture-time cadence hint.  The sender rounds it
+      // to a source-frame opportunity and starts earlier when delivery time is
+      // needed to meet the hard content-age deadline.
       // Keep the normal crop close to one MTU-sized RB/1 data packet.  At the
       // rebuild profile's 100 kbps shared ceiling, a two-fragment reference
       // can otherwise consume the H.265 budget and force P-frame recovery.

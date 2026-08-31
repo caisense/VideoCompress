@@ -27,6 +27,10 @@ REFERENCE_CONTENT_HARD_MAX_AGE_MS = 450
 REFERENCE_FUTURE_MAX_MS = 100
 STATE_SYNC_MAX_MS = 100
 SR_MODEL_INPUT_SIDE = 96
+REGISTRATION_MIN_AREA_RATIO = 0.70
+REGISTRATION_MAX_AREA_RATIO = 1.40
+REGISTRATION_MIN_SIDE_RATIO = 0.50
+REGISTRATION_MAX_SIDE_RATIO = 2.00
 
 
 def wire_bytes(udp_payload_bytes: int) -> int:
@@ -83,6 +87,15 @@ class VisualReference:
     received_at: float
     recovered_with_parity: bool
     pts_ms: int
+
+
+@dataclasses.dataclass(frozen=True)
+class RegistrationResult:
+    crop: Optional[Tuple[int, int, int, int]]
+    reason: str
+    dx_ratio: float
+    dy_ratio: float
+    area_ratio: float
 
 
 class RebuildReceiver:
@@ -898,19 +911,35 @@ class RebuildComposer:
         self.sr_compute_samples_ms: Deque[float] = collections.deque(maxlen=64)
         self.registration_drops = 0
         self.content_drops = 0
+        self.no_reference_drops = 0
+        self.state_drops = 0
+        self.generation_drops = 0
+        self.cache_drops = 0
+        self.geom_invalid_drops = 0
+        self.geom_scale_drops = 0
+        self.geom_outside_drops = 0
         self.content_matches = 0
         self.age_drops = 0
         self.future_drops = 0
         self.timing_drops = 0
+        self.reference_ready = 0
         self.last_refs_used = 0
         self.last_ref_age: Optional[float] = None
         self.last_ref_content_age_ms: Optional[int] = None
         self.last_reference_pts_ms: Optional[int] = None
         self.last_reference_generation: Optional[int] = None
         self.last_match_score: Optional[float] = None
+        self.last_drop_reason = "NONE"
+        self.last_geom_dx_ratio = 0.0
+        self.last_geom_dy_ratio = 0.0
+        self.last_geom_area_ratio = 0.0
         self.last_rebuild_percent = 0.0
         self.last_spatial = "BASE-LANCZOS"
         self.last_chroma_mode = "COLOR"
+        self.last_sr_state = "MISS"
+        self.new_reference_first_frames = 0
+        self.new_reference_first_frame_sr_hits = 0
+        self._seen_reference_frame_keys = set()
         self._smooth_boxes: Dict[tuple, Tuple[float, float, float, float]] = {}
         self._smooth_generation: Optional[int] = None
         self._composed_source_sequence: Optional[int] = None
@@ -963,9 +992,9 @@ class RebuildComposer:
             effective_video, (reference.pts_ms * 90) & 0xFFFFFFFF)
         return int(round(age_ticks / 90.0))
 
-    def _reference_gate_reason(self, reference: VisualReference,
-                               allow_newer_than_advertised: bool = False
-                               ) -> Optional[str]:
+    def _reference_identity_gate_reason(
+            self, reference: VisualReference,
+            allow_newer_than_advertised: bool = False) -> Optional[str]:
         if (self._latest_generation is not None and
                 reference.generation != self._latest_generation):
             return "generation"
@@ -985,6 +1014,26 @@ class RebuildComposer:
                     not RebuildReceiver._newer_u16(
                         reference.reference_generation, advertised)):
                 return "advertised-reference"
+        return None
+
+    def _reference_compute_gate_reason(self, reference: VisualReference) -> Optional[str]:
+        """Validate an SR candidate without applying the render-time future gate."""
+        reason = self._reference_identity_gate_reason(
+            reference, allow_newer_than_advertised=True)
+        if reason is not None:
+            return reason
+        age_ms = self._content_age_ms(reference)
+        # A missing video clock is not a reason to discard a useful local SR
+        # result.  The render gate still refuses to paint until it has a PTS.
+        if age_ms is not None and age_ms > self.reference_content_hard_max_age_ms:
+            return "expired"
+        return None
+
+    def _reference_render_gate_reason(self, reference: VisualReference) -> Optional[str]:
+        """Validate a reference for display, including the strict PTS gates."""
+        reason = self._reference_identity_gate_reason(reference)
+        if reason is not None:
+            return reason
         age_ms = self._content_age_ms(reference)
         if age_ms is None:
             return "clock"
@@ -1004,6 +1053,32 @@ class RebuildComposer:
             self.sr_future_drops += 1
         elif reason != "clock":
             self.sr_invalid_drops += 1
+
+    def _record_drop(self, reason: str) -> None:
+        self.last_drop_reason = reason
+        if reason == "NOREF":
+            self.no_reference_drops += 1
+        elif reason == "STATE":
+            self.state_drops += 1
+        elif reason == "GEN":
+            self.generation_drops += 1
+        elif reason == "CACHE":
+            self.cache_drops += 1
+        elif reason == "GEOM_INVALID":
+            self.geom_invalid_drops += 1
+        elif reason == "GEOM_SCALE":
+            self.geom_scale_drops += 1
+        elif reason == "GEOM_OUTSIDE":
+            self.geom_outside_drops += 1
+
+    def _record_first_reference_frame(self, key: tuple) -> bool:
+        if key in self._seen_reference_frame_keys:
+            return False
+        self._seen_reference_frame_keys.add(key)
+        if len(self._seen_reference_frame_keys) > 128:
+            self._seen_reference_frame_keys.pop()
+        self.new_reference_first_frames += 1
+        return True
 
     def _submit(self, reference: VisualReference) -> bool:
         """Submit exactly one model-native job.  Caller owns UI-thread access."""
@@ -1047,10 +1122,7 @@ class RebuildComposer:
         if key in self.cache:
             self.pending_reference = None
             return
-        reason = self._reference_gate_reason(
-            reference, allow_newer_than_advertised=True)
-        if reason in ("clock", "future"):
-            return
+        reason = self._reference_compute_gate_reason(reference)
         if reason is not None:
             self.pending_reference = None
             self._record_sr_rejection(reason, before_submit=True)
@@ -1080,17 +1152,7 @@ class RebuildComposer:
             # immediate display path; the candidate can use SR once ready.
             self._defer_latest(reference)
             return
-        reason = self._reference_gate_reason(
-            reference, allow_newer_than_advertised=True)
-        if reason == "clock":
-            self._defer_latest(reference)
-            return
-        if reason == "future":
-            if (self.pending_reference is None or
-                    self._reference_key(self.pending_reference) != key):
-                self.sr_future_waits += 1
-            self._defer_latest(reference)
-            return
+        reason = self._reference_compute_gate_reason(reference)
         if reason is not None:
             self._record_sr_rejection(reason, before_submit=True)
             return
@@ -1129,8 +1191,7 @@ class RebuildComposer:
         if reference is None:
             self.sr_stale += 1
         else:
-            reason = self._reference_gate_reason(
-                reference, allow_newer_than_advertised=True)
+            reason = self._reference_compute_gate_reason(reference)
             if reason is not None:
                 self.sr_stale += 1
                 self._record_sr_rejection(reason, before_submit=False)
@@ -1322,53 +1383,85 @@ class RebuildComposer:
                                    right=right, bottom=bottom)
 
     @staticmethod
-    def _registered_crop(reference: VisualReference, target: rb.TargetState,
-                         scale_x: float, scale_y: float) -> Optional[Tuple[int, int, int, int]]:
-        """Map a reference crop through the reference/current detector boxes.
+    def _registration_details(
+            reference: VisualReference, target: rb.TargetState,
+            scale_x: float, scale_y: float,
+            output_size: Optional[Tuple[int, int]] = None) -> RegistrationResult:
+        """Predict a crop position and report geometry failures separately.
 
-        The crop margin is not symmetric when a subject touches an image edge;
-        using only crop width/height and the current box centre therefore
-        shifts the old background into the new frame.  The reference crop
-        offsets relative to the captured detector-box centre preserve those
-        edge offsets while the area-derived scale keeps the geometry isotropic.
+        Detector motion is an input to the reference-to-current mapping, not a
+        failure condition.  The content matcher below remains the identity
+        check after this geometric prediction.
         """
-        ref_left, ref_top, ref_right, ref_bottom = reference.reference_bbox
-        cur_left, cur_top, cur_right, cur_bottom = (
-            target.left, target.top, target.right, target.bottom)
+        try:
+            ref_left, ref_top, ref_right, ref_bottom = (
+                float(value) for value in reference.reference_bbox)
+            cur_left, cur_top, cur_right, cur_bottom = (
+                float(value) for value in
+                (target.left, target.top, target.right, target.bottom))
+            crop_left, crop_top, crop_right, crop_bottom = (
+                float(value) for value in reference.crop)
+        except (TypeError, ValueError):
+            return RegistrationResult(None, "GEOM_INVALID", 0.0, 0.0, 0.0)
+        values = (ref_left, ref_top, ref_right, ref_bottom, cur_left, cur_top,
+                  cur_right, cur_bottom, crop_left, crop_top, crop_right,
+                  crop_bottom, scale_x, scale_y)
+        if not all(math.isfinite(value) for value in values):
+            return RegistrationResult(None, "GEOM_INVALID", 0.0, 0.0, 0.0)
         ref_width = ref_right - ref_left
         ref_height = ref_bottom - ref_top
         cur_width = cur_right - cur_left
         cur_height = cur_bottom - cur_top
-        if min(ref_width, ref_height, cur_width, cur_height) <= 0:
-            return None
-        center_dx = abs((cur_left + cur_right) * 0.5 -
-                        (ref_left + ref_right) * 0.5)
-        center_dy = abs((cur_top + cur_bottom) * 0.5 -
-                        (ref_top + ref_bottom) * 0.5)
-        area_ratio = (cur_width * cur_height) / float(ref_width * ref_height)
-        # A reference older than the PTS gate can still be present in the
-        # receiver cache; reject a large motion/scale mismatch before any
-        # pixels are painted.
-        if (center_dx > 0.25 * max(ref_width, cur_width) or
-                center_dy > 0.25 * max(ref_height, cur_height) or
-                area_ratio < 0.70 or area_ratio > 1.40):
-            return None
-        crop_left, crop_top, crop_right, crop_bottom = reference.crop
-        # Use one source-space scale derived from area.  Independent x/y
-        # scaling lets a one-frame detector aspect-ratio wobble breathe the
-        # reference crop and creates a visible edge oscillation.
+        if min(ref_width, ref_height, cur_width, cur_height) <= 0 or \
+                scale_x <= 0 or scale_y <= 0:
+            return RegistrationResult(None, "GEOM_INVALID", 0.0, 0.0, 0.0)
+        area_ratio = (cur_width * cur_height) / (ref_width * ref_height)
+        width_ratio = cur_width / ref_width
+        height_ratio = cur_height / ref_height
+        dx_ratio = abs((cur_left + cur_right - ref_left - ref_right) * 0.5) / \
+            max(ref_width, cur_width)
+        dy_ratio = abs((cur_top + cur_bottom - ref_top - ref_bottom) * 0.5) / \
+            max(ref_height, cur_height)
+        if (width_ratio < REGISTRATION_MIN_SIDE_RATIO or
+                width_ratio > REGISTRATION_MAX_SIDE_RATIO or
+                height_ratio < REGISTRATION_MIN_SIDE_RATIO or
+                height_ratio > REGISTRATION_MAX_SIDE_RATIO or
+                area_ratio < REGISTRATION_MIN_AREA_RATIO or
+                area_ratio > REGISTRATION_MAX_AREA_RATIO):
+            return RegistrationResult(None, "GEOM_SCALE", dx_ratio, dy_ratio, area_ratio)
+        crop_width = crop_right - crop_left
+        crop_height = crop_bottom - crop_top
+        if crop_width <= 0 or crop_height <= 0:
+            return RegistrationResult(None, "GEOM_INVALID", dx_ratio, dy_ratio, area_ratio)
         isotropic_scale = math.sqrt(area_ratio)
         ref_center_x = (ref_left + ref_right) * 0.5
         ref_center_y = (ref_top + ref_bottom) * 0.5
         cur_center_x = (cur_left + cur_right) * 0.5
         cur_center_y = (cur_top + cur_bottom) * 0.5
-        x0 = int(round((cur_center_x + (crop_left - ref_center_x) * isotropic_scale) * scale_x))
-        y0 = int(round((cur_center_y + (crop_top - ref_center_y) * isotropic_scale) * scale_y))
-        x1 = int(round((cur_center_x + (crop_right - ref_center_x) * isotropic_scale) * scale_x))
-        y1 = int(round((cur_center_y + (crop_bottom - ref_center_y) * isotropic_scale) * scale_y))
+        projected = (
+            (cur_center_x + (crop_left - ref_center_x) * isotropic_scale) * scale_x,
+            (cur_center_y + (crop_top - ref_center_y) * isotropic_scale) * scale_y,
+            (cur_center_x + (crop_right - ref_center_x) * isotropic_scale) * scale_x,
+            (cur_center_y + (crop_bottom - ref_center_y) * isotropic_scale) * scale_y,
+        )
+        if not all(math.isfinite(value) for value in projected):
+            return RegistrationResult(None, "GEOM_INVALID", dx_ratio, dy_ratio, area_ratio)
+        x0, y0, x1, y1 = (int(round(value)) for value in projected)
         if x1 <= x0 or y1 <= y0:
-            return None
-        return x0, y0, x1, y1
+            return RegistrationResult(None, "GEOM_INVALID", dx_ratio, dy_ratio, area_ratio)
+        if output_size is not None:
+            output_width, output_height = output_size
+            if (x1 <= 0 or y1 <= 0 or x0 >= output_width or
+                    y0 >= output_height):
+                return RegistrationResult(None, "GEOM_OUTSIDE", dx_ratio, dy_ratio, area_ratio)
+        return RegistrationResult((x0, y0, x1, y1), "NONE",
+                                  dx_ratio, dy_ratio, area_ratio)
+
+    @staticmethod
+    def _registered_crop(reference: VisualReference, target: rb.TargetState,
+                         scale_x: float, scale_y: float) -> Optional[Tuple[int, int, int, int]]:
+        return RebuildComposer._registration_details(
+            reference, target, scale_x, scale_y).crop
 
     def render(self, base: np.ndarray, state: Optional[rb.StateRecord], generation: int,
                references: Dict[int, VisualReference], now: Optional[float] = None,
@@ -1408,6 +1501,7 @@ class RebuildComposer:
         monochrome = self._nearly_grayscale(canvas)
         self.last_chroma_mode = "MONO" if monochrome else "COLOR"
         rebuilt_pixels = np.zeros((output_height, output_width), dtype=np.uint8)
+        self.reference_ready = 0
         self.last_refs_used = 0
         self.last_ref_age = None
         self.last_ref_content_age_ms = None
@@ -1415,8 +1509,11 @@ class RebuildComposer:
         self.last_reference_generation = None
         self.last_match_score = None
         self.last_rebuild_percent = 0.0
-        self.registration_drops = 0
-        self.content_drops = 0
+        self.last_drop_reason = "NONE"
+        self.last_geom_dx_ratio = 0.0
+        self.last_geom_dy_ratio = 0.0
+        self.last_geom_area_ratio = 0.0
+        self.last_sr_state = "MISS"
         used_sr = False
         effective_video_rtp_timestamp = None
         if video_rtp_timestamp is not None:
@@ -1434,16 +1531,24 @@ class RebuildComposer:
                 active_smooth_keys.add(
                     (generation, target.track_id, target.reference_generation))
                 reference = references.get(target.track_id)
-                if (reference is None or reference.generation != generation or
+                if reference is None:
+                    self._record_drop("NOREF")
+                    continue
+                if (reference.generation != generation or
                         (target.reference_generation and
-                         reference.reference_generation != target.reference_generation) or
-                        now - reference.received_at > self.reference_cache_ttl_ms / 1000.0):
+                         reference.reference_generation != target.reference_generation)):
+                    self._record_drop("GEN")
+                    continue
+                self.reference_ready += 1
+                if now - reference.received_at > self.reference_cache_ttl_ms / 1000.0:
+                    self._record_drop("CACHE")
                     continue
                 self.last_ref_age = max(0.0, now - reference.received_at)
                 self.last_reference_pts_ms = reference.pts_ms
                 self.last_reference_generation = reference.reference_generation
                 if effective_video_rtp_timestamp is None:
                     self.timing_drops += 1
+                    self._record_drop("STATE")
                     continue
                 content_age_ticks = RebuildReceiver._signed_pts_delta(
                     effective_video_rtp_timestamp,
@@ -1452,19 +1557,33 @@ class RebuildComposer:
                 self.last_ref_content_age_ms = content_age_ms
                 if content_age_ms > self.reference_content_hard_max_age_ms:
                     self.age_drops += 1
+                    self._record_drop("AGE")
                     continue
                 if content_age_ms < -self.reference_future_max_ms:
                     self.future_drops += 1
+                    self._record_drop("FUTURE")
                     continue
-                registered = self._registered_crop(reference, target, scale_x, scale_y)
-                if registered is None:
+                reference_key = self._reference_key(reference)
+                first_reference_frame = self._record_first_reference_frame(reference_key)
+                geometry = self._registration_details(
+                    reference, target, scale_x, scale_y,
+                    output_size=(output_width, output_height))
+                self.last_geom_dx_ratio = geometry.dx_ratio
+                self.last_geom_dy_ratio = geometry.dy_ratio
+                self.last_geom_area_ratio = geometry.area_ratio
+                if geometry.crop is None:
                     self.registration_drops += 1
+                    self._record_drop(geometry.reason)
                     continue
-                x, y, x1, y1 = registered
+                x, y, x1, y1 = geometry.crop
                 crop_width = max(2, x1 - x)
                 crop_height = max(2, y1 - y)
                 patch, mask, enhanced = self._assets(
                     reference, (crop_width, crop_height), render_cache_keys)
+                if first_reference_frame:
+                    if enhanced:
+                        self.new_reference_first_frame_sr_hits += 1
+                    self.last_sr_state = "HIT" if enhanced else "MISS"
                 corrected, score, attempted = self._content_register(
                     canvas, patch, mask, x, y)
                 if attempted:
@@ -1474,6 +1593,7 @@ class RebuildComposer:
                     if corrected is None:
                         self.registration_drops += 1
                         self.content_drops += 1
+                        self._record_drop("CONTENT")
                         continue
                     if score is not None:
                         self.content_matches += 1
@@ -1491,6 +1611,7 @@ class RebuildComposer:
                     rebuilt_pixels[y0:y1, x0:x1] = np.maximum(
                         rebuilt_pixels[y0:y1, x0:x1], (mask_roi > 32).astype(np.uint8))
                 used_sr = used_sr or enhanced
+                self.last_sr_state = "HIT" if enhanced else self.last_sr_state
                 self.last_refs_used += 1
                 if self.draw_targets:
                     left = int(round(target.left * scale_x))
@@ -1509,6 +1630,7 @@ class RebuildComposer:
             }
         else:
             self._smooth_boxes.clear()
+            self._record_drop("STATE")
         self.last_spatial = "ROI-ESRGAN" if used_sr else (
             "ROI-LANCZOS" if self.last_refs_used else "BASE-LANCZOS")
         if output_width > 0 and output_height > 0:
@@ -1524,10 +1646,13 @@ class RebuildComposer:
 
     def snapshot(self) -> dict:
         sorted_sr_ms = sorted(self.sr_compute_samples_ms)
+        sr_p50_ms = (sorted_sr_ms[max(0, math.ceil(len(sorted_sr_ms) * 0.50) - 1)]
+                     if sorted_sr_ms else 0.0)
         sr_p95_ms = (sorted_sr_ms[max(0, math.ceil(len(sorted_sr_ms) * 0.95) - 1)]
                      if sorted_sr_ms else 0.0)
         return {
             "spatial": self.last_spatial,
+            "reference_ready": self.reference_ready,
             "refs_used": self.last_refs_used,
             "reference_age": self.last_ref_age,
             "reference_content_age_ms": self.last_ref_content_age_ms,
@@ -1541,7 +1666,20 @@ class RebuildComposer:
             "age_drops": self.age_drops,
             "future_drops": self.future_drops,
             "timing_drops": self.timing_drops,
+            "no_reference_drops": self.no_reference_drops,
+            "state_drops": self.state_drops,
+            "generation_drops": self.generation_drops,
+            "cache_drops": self.cache_drops,
+            "geom_invalid_drops": self.geom_invalid_drops,
+            "geom_scale_drops": self.geom_scale_drops,
+            "scale_drops": self.geom_scale_drops,
+            "geom_outside_drops": self.geom_outside_drops,
+            "last_drop_reason": self.last_drop_reason,
+            "geom_dx_ratio": self.last_geom_dx_ratio,
+            "geom_dy_ratio": self.last_geom_dy_ratio,
+            "geom_area_ratio": self.last_geom_area_ratio,
             "sr_model": self.resolver.model_name,
+            "sr_state": self.last_sr_state,
             "sr_pending": self.future is not None,
             "sr_queued": self.pending_reference is not None,
             "sr_running": self.future is not None,
@@ -1559,10 +1697,17 @@ class RebuildComposer:
             "sr_cache_misses": self.sr_cache_misses,
             "last_sr_lookup": self.last_sr_lookup,
             "sr_last_ms": self.sr_last_ms,
+            "sr_p50_ms": sr_p50_ms,
             "sr_p95_ms": sr_p95_ms,
             "registration_drops": self.registration_drops,
             "content_drops": self.content_drops,
             "content_matches": self.content_matches,
+            "new_reference_first_frames": self.new_reference_first_frames,
+            "new_reference_first_frame_sr_hits": self.new_reference_first_frame_sr_hits,
+            "new_reference_first_frame_sr_hit_rate": (
+                self.new_reference_first_frame_sr_hits /
+                float(self.new_reference_first_frames)
+                if self.new_reference_first_frames else 0.0),
             "match_score": self.last_match_score,
             "composed_source_sequence": self._composed_source_sequence,
             "composed_frames": self.composed_frames,

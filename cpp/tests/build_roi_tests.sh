@@ -77,6 +77,11 @@ g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
 "$out_dir/test_rebuild_protocol"
 
 g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
+  "$cpp_dir/tests/test_rebuild_refresh.cc" \
+  -o "$out_dir/test_rebuild_refresh"
+"$out_dir/test_rebuild_refresh"
+
+g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
   "$cpp_dir/transport/rate_pacer.cc" \
   "$cpp_dir/transport/packetizer.cc" \
   "$cpp_dir/transport/udp_sender.cc" \

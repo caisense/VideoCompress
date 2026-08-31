@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -13,6 +14,7 @@
 
 #include "common/config.h"
 #include "common/frame_meta.h"
+#include "transport/rebuild_refresh.h"
 #include "transport/rate_pacer.h"
 #include "transport/rebuild_protocol.h"
 
@@ -43,9 +45,27 @@ struct RebuildSenderSnapshot {
     uint64_t last_reference_capture_to_send_us;
     uint64_t reference_capture_to_send_p50_us;
     uint64_t reference_capture_to_send_p95_us;
+    // Pure reference transfer span, from the first to the last paced packet.
+    // Keep this separate from capture-to-send, which includes RKNN/JPEG work.
+    uint64_t last_reference_delivery_us;
+    uint64_t reference_delivery_p50_us;
+    uint64_t reference_delivery_p95_us;
+    uint64_t last_reference_interval_us;
+    uint64_t reference_interval_p50_us;
+    uint64_t reference_interval_p95_us;
+    uint64_t reference_interval_max_us;
     uint64_t last_reference_blob_bytes;
     uint64_t last_reference_chunk_count;
     uint64_t last_reference_fec_bytes;
+    uint16_t last_refresh_track_id;
+    int last_reference_capture_age_ms;
+    int last_reference_ready_age_ms;
+    int last_refresh_threshold_ms;
+    int last_estimated_delivery_ms;
+    int last_refresh_deadline_ms;
+    int last_refresh_quantum_ms;
+    bool last_refresh_decision_start;
+    std::string last_refresh_reason;
     std::string last_error;
 
     RebuildSenderSnapshot();
@@ -136,7 +156,8 @@ private:
                         RebuildPatchFragment *metadata, std::vector<uint8_t> *blob,
                         size_t *jpeg_bytes, std::string *error) const;
     int estimatedReferenceDeliveryMs() const;
-    int referenceRefreshThresholdMs() const;
+    void recordRefreshDecision(uint16_t track_id,
+                               const RebuildRefreshDecision &decision);
     bool isEnabled() const;
     void workerLoop();
 
@@ -166,6 +187,9 @@ private:
     PendingReference pending_reference_;
     RebuildSenderSnapshot snapshot_;
     std::vector<uint64_t> reference_capture_to_send_samples_us_;
+    std::vector<uint64_t> reference_delivery_samples_us_;
+    std::vector<uint64_t> reference_interval_samples_us_;
+    std::map<uint16_t, uint64_t> previous_reference_capture_times_us_;
 };
 
 }  // namespace roi_h265

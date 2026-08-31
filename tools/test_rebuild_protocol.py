@@ -678,7 +678,7 @@ class RebuildProtocolTests(unittest.TestCase):
         finally:
             composer.close()
 
-    def test_future_prefetch_waits_until_video_clock_catches_up(self):
+    def test_future_reference_is_prefetched_but_rendered_only_after_clock_catches_up(self):
         class FakeResolver:
             scale = 2
             available = True
@@ -694,12 +694,10 @@ class RebuildProtocolTests(unittest.TestCase):
             composer.update_timing(800 * 90, generation=5, active_track_ids={4})
             composer.prefetch(reference)
             values = composer.snapshot()
-            self.assertEqual(values["sr_jobs"], 0)
-            self.assertEqual(values["sr_queue"], 1)
-            self.assertEqual(values["sr_future_waits"], 1)
+            self.assertEqual(values["sr_jobs"], 1)
+            self.assertEqual(values["sr_future_waits"], 0)
             self.assertEqual(values["sr_future_drops"], 0)
 
-            composer.update_timing(900 * 90, generation=5, active_track_ids={4})
             deadline = time.monotonic() + 1.0
             while composer.snapshot()["sr_done"] != 1 and time.monotonic() < deadline:
                 composer.prefetch_pending()
@@ -708,6 +706,27 @@ class RebuildProtocolTests(unittest.TestCase):
             self.assertEqual(values["sr_jobs"], 1)
             self.assertEqual(values["sr_done"], 1)
             self.assertEqual(values["sr_queue"], 0)
+            self.assertIn((5, 4, 2), composer.cache)
+
+            target = rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 1)
+            state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+            base = np.full((144, 256, 3), 80, dtype=np.uint8)
+            _, future_mode = composer.render(
+                base, state, 5, {4: reference}, now=10.0,
+                video_rtp_timestamp=800 * 90, source_sequence=1)
+            values = composer.snapshot()
+            self.assertEqual(future_mode, "BASE-LANCZOS")
+            self.assertEqual(values["future_drops"], 1)
+            self.assertEqual(values["last_drop_reason"], "FUTURE")
+            self.assertIn((5, 4, 2), composer.cache)
+
+            _, ready_mode = composer.render(
+                base, state, 5, {4: reference}, now=10.1,
+                video_rtp_timestamp=900 * 90, source_sequence=2)
+            values = composer.snapshot()
+            self.assertEqual(ready_mode, "ROI-ESRGAN")
+            self.assertEqual(values["future_drops"], 1)
+            self.assertEqual(values["sr_cache_hits"], 1)
         finally:
             composer.close()
 
@@ -876,10 +895,96 @@ class RebuildProtocolTests(unittest.TestCase):
         target = rb.TargetState(4, 0, 91, 65, 55, 175, 165, 2, 1)
         registered = RebuildComposer._registered_crop(reference, target, 1.0, 1.0)
         self.assertEqual(registered, (10, 33, 208, 187))
-        moved = rb.TargetState(4, 0, 91, 220, 80, 340, 200, 2, 1)
-        self.assertIsNone(RebuildComposer._registered_crop(reference, moved, 1.0, 1.0))
+        moved = rb.TargetState(4, 0, 91, 220, 80, 320, 180, 2, 1)
+        self.assertEqual(
+            RebuildComposer._registered_crop(reference, moved, 1.0, 1.0),
+            (170, 60, 350, 200))
         enlarged = rb.TargetState(4, 0, 91, 100, 80, 260, 240, 2, 1)
         self.assertIsNone(RebuildComposer._registered_crop(reference, enlarged, 1.0, 1.0))
+
+    def test_registration_reports_motion_and_fail_closed_geometry_reasons(self):
+        reference = type("Reference", (), {
+            "reference_bbox": (50, 40, 150, 140),
+            "crop": (0, 20, 180, 160),
+        })()
+        moved = rb.TargetState(4, 0, 91, 220, 80, 320, 180, 2, 1)
+        result = RebuildComposer._registration_details(
+            reference, moved, 1.0, 1.0, output_size=(640, 360))
+        self.assertEqual(result.reason, "NONE")
+        self.assertGreater(result.dx_ratio, 1.0)
+        self.assertEqual(result.area_ratio, 1.0)
+
+        invalid = rb.TargetState(4, 0, 91, 100, 80, 90, 200, 2, 1)
+        self.assertEqual(
+            RebuildComposer._registration_details(reference, invalid, 1.0, 1.0).reason,
+            "GEOM_INVALID")
+        scaled = rb.TargetState(4, 0, 91, 100, 80, 300, 280, 2, 1)
+        self.assertEqual(
+            RebuildComposer._registration_details(reference, scaled, 1.0, 1.0).reason,
+            "GEOM_SCALE")
+        outside = rb.TargetState(4, 0, 91, 800, 80, 900, 180, 2, 1)
+        self.assertEqual(
+            RebuildComposer._registration_details(
+                reference, outside, 1.0, 1.0, output_size=(640, 360)).reason,
+            "GEOM_OUTSIDE")
+
+    def test_moving_target_is_rebuilt_without_absolute_center_gate(self):
+        class ManualResolver:
+            scale = 2
+            available = False
+            model_name = "Fake-SR"
+
+            @staticmethod
+            def upscale(image, target_size):
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        reference = self._visual_reference()
+        target = rb.TargetState(4, 0, 91, 280, 80, 400, 280, 2, 1)
+        state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+        base = np.full((144, 256, 3), 80, dtype=np.uint8)
+        composer = RebuildComposer(resolver=ManualResolver())
+        try:
+            _, mode = composer.render(
+                base, state, 5, {4: reference}, now=10.0,
+                video_rtp_timestamp=1000 * 90, source_sequence=1)
+            values = composer.snapshot()
+            self.assertEqual(mode, "ROI-LANCZOS")
+            self.assertEqual(values["refs_used"], 1)
+            self.assertEqual(values["registration_drops"], 0)
+            self.assertEqual(values["last_drop_reason"], "NONE")
+            self.assertGreater(values["geom_dx_ratio"], 1.0)
+        finally:
+            composer.close()
+
+    def test_content_mismatch_has_a_distinct_drop_reason(self):
+        class ManualResolver:
+            scale = 2
+            available = False
+            model_name = "Fake-SR"
+
+            @staticmethod
+            def upscale(image, target_size):
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        random = np.random.RandomState(123)
+        reference = dataclasses.replace(
+            self._visual_reference(),
+            image=random.randint(0, 256, (80, 48, 3), dtype=np.uint8))
+        target = rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 1)
+        state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+        base = random.randint(0, 256, (144, 256, 3), dtype=np.uint8)
+        composer = RebuildComposer(resolver=ManualResolver())
+        try:
+            _, mode = composer.render(
+                base, state, 5, {4: reference}, now=10.0,
+                video_rtp_timestamp=1000 * 90, source_sequence=1)
+            values = composer.snapshot()
+            self.assertEqual(mode, "BASE-LANCZOS")
+            self.assertEqual(values["last_drop_reason"], "CONTENT")
+            self.assertEqual(values["content_drops"], 1)
+            self.assertEqual(values["scale_drops"], values["geom_scale_drops"])
+        finally:
+            composer.close()
 
     def test_registration_uses_isotropic_area_scale(self):
         reference = type("Reference", (), {

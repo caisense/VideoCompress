@@ -92,8 +92,17 @@ RebuildSenderSnapshot::RebuildSenderSnapshot()
       last_reference_last_packet_send_time_us(0),
       last_reference_queue_delay_us(0), last_reference_capture_to_send_us(0),
       reference_capture_to_send_p50_us(0),
-      reference_capture_to_send_p95_us(0), last_reference_blob_bytes(0),
-      last_reference_chunk_count(0), last_reference_fec_bytes(0) {}
+      reference_capture_to_send_p95_us(0), last_reference_delivery_us(0),
+      reference_delivery_p50_us(0), reference_delivery_p95_us(0),
+      last_reference_interval_us(0),
+      reference_interval_p50_us(0), reference_interval_p95_us(0),
+      reference_interval_max_us(0), last_reference_blob_bytes(0),
+      last_reference_chunk_count(0), last_reference_fec_bytes(0),
+      last_refresh_track_id(0), last_reference_capture_age_ms(0),
+      last_reference_ready_age_ms(0), last_refresh_threshold_ms(0),
+      last_estimated_delivery_ms(0), last_refresh_deadline_ms(0),
+      last_refresh_quantum_ms(0), last_refresh_decision_start(false),
+      last_refresh_reason("NO_ACTIVE_TARGET") {}
 
 RebuildSender::Track::Track()
     : id(0), class_id(-1), confidence(0.0f), last_seen_frame(0),
@@ -506,11 +515,11 @@ int RebuildSender::estimatedReferenceDeliveryMs() const {
     // blob size gives a much tighter estimate without pretending to exceed
     // the shared RatePacer budget.
     uint64_t last_blob_bytes = 0;
-    uint64_t observed_p95_us = 0;
+    uint64_t observed_delivery_p95_us = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         last_blob_bytes = snapshot_.last_reference_blob_bytes;
-        observed_p95_us = snapshot_.reference_capture_to_send_p95_us;
+        observed_delivery_p95_us = snapshot_.reference_delivery_p95_us;
     }
     const size_t estimated_blob = std::min<size_t>(
         12U * 1024U, last_blob_bytes > 0
@@ -526,22 +535,23 @@ int RebuildSender::estimatedReferenceDeliveryMs() const {
     const int theoretical_ms = static_cast<int>(
         (wire_bytes * 8000U + static_cast<size_t>(bitrate) - 1U) /
         static_cast<size_t>(bitrate));
-    const int observed_ms = observed_p95_us > 0
-        ? static_cast<int>((observed_p95_us + 999U) / 1000U) : 0;
+    const int observed_ms = observed_delivery_p95_us > 0
+        ? static_cast<int>((observed_delivery_p95_us + 999U) / 1000U) : 0;
     return std::max(theoretical_ms, observed_ms);
 }
 
-int RebuildSender::referenceRefreshThresholdMs() const {
-    const int delivery_ms = estimatedReferenceDeliveryMs();
-    const int deadline_start = std::max(0, config_.patch_hard_deadline_ms -
-        config_.patch_refresh_guard_ms - delivery_ms);
-    // The soft cadence is a lower bound, not a target that the delivery
-    // estimate may shorten.  At 6 fps, pulling 350 ms down to one 167 ms frame
-    // published a new reference_generation before an asynchronous SR result
-    // was eligible on the next immutable source frame.  Fast transfers may
-    // wait until the latest safe deadline start; slow transfers retain the
-    // minimum hold instead of creating an unusable per-frame generation.
-    return std::max(config_.patch_soft_refresh_ms, deadline_start);
+void RebuildSender::recordRefreshDecision(
+        uint16_t track_id, const RebuildRefreshDecision &decision) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.last_refresh_track_id = track_id;
+    snapshot_.last_reference_capture_age_ms = decision.capture_age_ms;
+    snapshot_.last_reference_ready_age_ms = decision.ready_age_ms;
+    snapshot_.last_refresh_threshold_ms = decision.refresh_threshold_ms;
+    snapshot_.last_estimated_delivery_ms = decision.estimated_delivery_ms;
+    snapshot_.last_refresh_deadline_ms = decision.next_deadline_ms;
+    snapshot_.last_refresh_quantum_ms = decision.scheduling_quantum_ms;
+    snapshot_.last_refresh_decision_start = decision.start;
+    snapshot_.last_refresh_reason = rebuildRefreshReasonName(decision.reason);
 }
 
 bool RebuildSender::beginReference(const Request &request, const ActiveTarget &active,
@@ -645,6 +655,12 @@ bool RebuildSender::sendPendingReferencePacket(std::string *error) {
         pending_reference_.capture_time_us > 0 &&
         pending_reference_.last_packet_send_time_us >= pending_reference_.capture_time_us
             ? pending_reference_.last_packet_send_time_us - pending_reference_.capture_time_us : 0;
+    const uint64_t delivery_us =
+        pending_reference_.first_packet_send_time_us > 0 &&
+        pending_reference_.last_packet_send_time_us >=
+            pending_reference_.first_packet_send_time_us
+            ? pending_reference_.last_packet_send_time_us -
+                pending_reference_.first_packet_send_time_us : 0;
     const uint64_t queue_delay_us =
         pending_reference_.first_packet_send_time_us >= pending_reference_.queue_enter_time_us
             ? pending_reference_.first_packet_send_time_us - pending_reference_.queue_enter_time_us : 0;
@@ -664,9 +680,39 @@ bool RebuildSender::sendPendingReferencePacket(std::string *error) {
             pending_reference_.last_packet_send_time_us;
         snapshot_.last_reference_queue_delay_us = queue_delay_us;
         snapshot_.last_reference_capture_to_send_us = capture_to_send_us;
+        snapshot_.last_reference_delivery_us = delivery_us;
+        reference_delivery_samples_us_.push_back(delivery_us);
+        if (reference_delivery_samples_us_.size() > 64U) {
+            reference_delivery_samples_us_.erase(reference_delivery_samples_us_.begin());
+        }
+        snapshot_.reference_delivery_p50_us = percentile(
+            reference_delivery_samples_us_, 0.50);
+        snapshot_.reference_delivery_p95_us = percentile(
+            reference_delivery_samples_us_, 0.95);
         snapshot_.last_reference_blob_bytes = pending_reference_.blob.size();
         snapshot_.last_reference_chunk_count = pending_reference_.chunk_count;
         snapshot_.last_reference_fec_bytes = pending_reference_.fec_bytes;
+        const uint16_t completed_track_id = pending_reference_.metadata.track_id;
+        const uint64_t previous_capture_time_us =
+            previous_reference_capture_times_us_[completed_track_id];
+        if (previous_capture_time_us > 0 &&
+                pending_reference_.capture_time_us > previous_capture_time_us) {
+            const uint64_t interval_us = pending_reference_.capture_time_us -
+                previous_capture_time_us;
+            reference_interval_samples_us_.push_back(interval_us);
+            if (reference_interval_samples_us_.size() > 64U) {
+                reference_interval_samples_us_.erase(reference_interval_samples_us_.begin());
+            }
+            snapshot_.last_reference_interval_us = interval_us;
+            snapshot_.reference_interval_p50_us = percentile(
+                reference_interval_samples_us_, 0.50);
+            snapshot_.reference_interval_p95_us = percentile(
+                reference_interval_samples_us_, 0.95);
+            snapshot_.reference_interval_max_us = *std::max_element(
+                reference_interval_samples_us_.begin(), reference_interval_samples_us_.end());
+        }
+        previous_reference_capture_times_us_[completed_track_id] =
+            pending_reference_.capture_time_us;
         if (capture_to_send_us > 0) {
             reference_capture_to_send_samples_us_.push_back(capture_to_send_us);
             if (reference_capture_to_send_samples_us_.size() > 64U) {
@@ -714,6 +760,20 @@ bool RebuildSender::process(const Request &request, std::string *error) {
         for (size_t index = 0; still_active && index < active.size(); ++index) {
             if (tracks_[active[index].track_index].id ==
                     pending_reference_.metadata.track_id) {
+                const Track &track = tracks_[active[index].track_index];
+                const uint64_t now_us = steadyNowMicros();
+                const uint64_t capture_time_us = request.frame->meta.capture_time_us;
+                const int capture_age = track.last_reference_capture_time_us > 0 &&
+                    capture_time_us >= track.last_reference_capture_time_us
+                    ? static_cast<int>((capture_time_us -
+                        track.last_reference_capture_time_us) / 1000U) : 0;
+                const int ready_age = track.last_reference_ready_time_us > 0 &&
+                    now_us >= track.last_reference_ready_time_us
+                    ? static_cast<int>((now_us - track.last_reference_ready_time_us) / 1000U) : 0;
+                recordRefreshDecision(track.id, evaluateRebuildRefresh(
+                    true, true, capture_age, ready_age, estimatedReferenceDeliveryMs(),
+                    request.source_fps, config_.patch_soft_refresh_ms,
+                    config_.patch_hard_deadline_ms, config_.patch_refresh_guard_ms));
                 return advance_reference();
             }
         }
@@ -721,39 +781,56 @@ bool RebuildSender::process(const Request &request, std::string *error) {
         std::lock_guard<std::mutex> lock(mutex_);
         ++snapshot_.cancelled_requests;
     }
-    if (active.empty()) return true;
+    if (active.empty()) {
+        recordRefreshDecision(0, RebuildRefreshDecision());
+        return true;
+    }
     // References are intentionally paced on the same physical token bucket
-    // as H.265.  Keep each generation for at least the soft interval, then use
-    // the estimated hard-deadline start to avoid needless early refreshes.
+    // as H.265.  The refresh decision uses the capture-time content age and
+    // rounds its continuous deadline back by half a source-frame quantum, so
+    // the last safe 6 fps opportunity is not missed.
     const uint64_t now_us = steadyNowMicros();
-    const int refresh_threshold_ms = referenceRefreshThresholdMs();
+    const uint64_t capture_time_us = request.frame->meta.capture_time_us;
+    const int estimated_delivery_ms = estimatedReferenceDeliveryMs();
     size_t selected = active.size();
-    uint64_t oldest_age_ms = 0;
+    RebuildRefreshDecision selected_decision;
+    bool have_decision = false;
+    int selected_priority = -1;
     for (size_t index = 0; index < active.size(); ++index) {
         const Track &track = tracks_[active[index].track_index];
-        if (!track.has_reference) {
-            selected = index;
-            break;
-        }
-        // The soft hold starts when the crop becomes available on the wire,
-        // not when its source frame was captured.  RKNN, JPEG, and paced UDP
-        // delivery can consume most of the hold before the receiver has
-        // any pixels; capture PTS remains the independent hard content-age
-        // clock carried by the protocol.
-        const uint64_t age_ms = track.last_reference_ready_time_us > 0 &&
+        const int capture_age = track.last_reference_capture_time_us > 0 &&
+            capture_time_us >= track.last_reference_capture_time_us
+            ? static_cast<int>((capture_time_us -
+                track.last_reference_capture_time_us) / 1000U) : 0;
+        const int ready_age = track.last_reference_ready_time_us > 0 &&
             now_us >= track.last_reference_ready_time_us
-            ? (now_us - track.last_reference_ready_time_us) / 1000U : 0U;
-        if (age_ms >= static_cast<uint64_t>(refresh_threshold_ms) &&
-            (selected == active.size() ||
-             age_ms > oldest_age_ms)) {
+            ? static_cast<int>((now_us - track.last_reference_ready_time_us) / 1000U) : 0;
+        const RebuildRefreshDecision decision = evaluateRebuildRefresh(
+            track.has_reference, false, capture_age, ready_age,
+            estimated_delivery_ms, request.source_fps,
+            config_.patch_soft_refresh_ms, config_.patch_hard_deadline_ms,
+            config_.patch_refresh_guard_ms);
+        int priority = decision.start ? 1 : 0;
+        if (decision.reason == REBUILD_REFRESH_NO_REFERENCE) priority = 3;
+        else if (decision.reason == REBUILD_REFRESH_HARD_DEADLINE) priority = 2;
+        if (!have_decision || priority > selected_priority ||
+                (priority == selected_priority &&
+                 decision.capture_age_ms > selected_decision.capture_age_ms)) {
+            have_decision = true;
+            selected_priority = priority;
             selected = index;
-            oldest_age_ms = age_ms;
+            selected_decision = decision;
         }
+    }
+    if (have_decision) {
+        recordRefreshDecision(tracks_[active[selected].track_index].id, selected_decision);
+    }
+    if (!have_decision || !selected_decision.start) {
+        return true;
     }
     // Start at most one reference transfer here, then emit a bounded burst.
     // Later source frames advance it in the same bounded bursts, giving H.265
     // and STATE regular opportunities on the shared 100 kbps bucket.
-    if (selected == active.size()) return true;
     if (!beginReference(request, active[selected], error)) return false;
     return advance_reference();
 }
