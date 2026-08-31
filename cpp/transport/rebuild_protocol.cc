@@ -282,7 +282,8 @@ bool parseRebuildPatchFragment(const uint8_t *payload, size_t length,
     parsed.mask_rle_bytes = readU16(payload + 36);
     parsed.chunk_bytes = readU16(payload + 38);
     parsed.data.assign(payload + kRebuildPatchFragmentHeaderBytes, payload + length);
-    if (parsed.track_id == 0 || parsed.data_fragments == 0 ||
+    if (parsed.track_id == 0 || parsed.reference_generation == 0 ||
+        parsed.data_fragments == 0 ||
         parsed.fragment_index > parsed.data_fragments || parsed.chunk_bytes == 0 ||
         parsed.data.size() > parsed.chunk_bytes || parsed.blob_size == 0 ||
         parsed.mask_rle_bytes > parsed.blob_size || parsed.right <= parsed.left ||

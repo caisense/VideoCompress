@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -32,6 +31,21 @@ struct RebuildSenderSnapshot {
     uint64_t patch_jpeg_bytes;
     uint64_t sent_wire_bytes;
     uint64_t cancelled_requests;
+    uint16_t last_reference_generation;
+    uint64_t last_reference_capture_time_us;
+    uint64_t last_reference_encode_finish_time_us;
+    uint64_t last_reference_queue_enter_time_us;
+    uint64_t last_reference_first_packet_send_time_us;
+    uint64_t last_reference_last_packet_send_time_us;
+    uint64_t last_reference_queue_delay_us;
+    // Sender-side capture-to-last-send timing.  This is not a receiver ACK
+    // or PC-complete timestamp; a PC-side delivery metric needs both clocks.
+    uint64_t last_reference_capture_to_send_us;
+    uint64_t reference_capture_to_send_p50_us;
+    uint64_t reference_capture_to_send_p95_us;
+    uint64_t last_reference_blob_bytes;
+    uint64_t last_reference_chunk_count;
+    uint64_t last_reference_fec_bytes;
     std::string last_error;
 
     RebuildSenderSnapshot();
@@ -72,7 +86,7 @@ private:
         uint64_t last_seen_frame;
         uint16_t reference_generation;
         bool has_reference;
-        std::chrono::steady_clock::time_point last_reference;
+        uint64_t last_reference_capture_time_us;
 
         Track();
     };
@@ -90,10 +104,20 @@ private:
         std::vector<uint8_t> parity;
         size_t next_data_index;
         size_t jpeg_bytes;
+        uint64_t capture_time_us;
+        uint64_t encode_finish_time_us;
+        uint64_t queue_enter_time_us;
+        uint64_t first_packet_send_time_us;
+        uint64_t last_packet_send_time_us;
+        size_t chunk_count;
+        size_t fec_bytes;
         bool parity_sent;
 
         PendingReference()
-            : active(false), next_data_index(0), jpeg_bytes(0), parity_sent(true) {}
+            : active(false), next_data_index(0), jpeg_bytes(0), capture_time_us(0),
+              encode_finish_time_us(0), queue_enter_time_us(0),
+              first_packet_send_time_us(0), last_packet_send_time_us(0),
+              chunk_count(0), fec_bytes(0), parity_sent(true) {}
         void clear() { *this = PendingReference(); }
     };
 
@@ -110,6 +134,8 @@ private:
     bool buildReference(const Request &request, const ActiveTarget &active,
                         RebuildPatchFragment *metadata, std::vector<uint8_t> *blob,
                         size_t *jpeg_bytes, std::string *error) const;
+    int estimatedReferenceDeliveryMs() const;
+    int referenceRefreshThresholdMs() const;
     bool isEnabled() const;
     void workerLoop();
 
@@ -135,11 +161,10 @@ private:
     uint16_t next_track_id_;
     uint32_t next_transfer_id_;
     uint32_t next_packet_sequence_;
-    bool has_last_transfer_;
-    std::chrono::steady_clock::time_point last_transfer_;
     std::vector<Track> tracks_;
     PendingReference pending_reference_;
     RebuildSenderSnapshot snapshot_;
+    std::vector<uint64_t> reference_capture_to_send_samples_us_;
 };
 
 }  // namespace roi_h265

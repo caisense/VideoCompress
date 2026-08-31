@@ -116,8 +116,10 @@ void printUsage(const char *program) {
         "          [--snapshot-ack-timeout-ms=300 --snapshot-max-retries=20 --snapshot-min-confidence=0.35]\n"
         "          [--rebuild-udp-port=5009 --rebuild-output-width=640 --rebuild-output-height=360]\n"
         "          [--rebuild-output-fps=12 --rebuild-min-confidence=0.35 --rebuild-max-targets=2]\n"
-        "          [--rebuild-patch-max-side=128 --rebuild-jpeg-quality=72 --rebuild-patch-max-bytes=1600]\n"
-        "          [--rebuild-patch-refresh-ms=700 --rebuild-chunk-bytes=1100 --rebuild-patch-packets-per-frame=2]\n"
+        "          [--rebuild-patch-max-side=96 --rebuild-jpeg-quality=50 --rebuild-patch-max-bytes=800]\n"
+        "          [--rebuild-reference-soft-refresh-ms=220 --rebuild-reference-hard-deadline-ms=450]\n"
+        "          [--rebuild-reference-refresh-guard-ms=75 --rebuild-chunk-bytes=1100]\n"
+        "          [--rebuild-patch-packets-per-frame=2]\n"
         "          [--rebuild-crop-margin-percent=20 --rebuild-parity=on|off]\n"
         "          [--event-push=on|off --event-udp-port=5010 --event-min-confidence=0.35]\n"
         "          [--event-heartbeat-ms=1000]\n"
@@ -330,11 +332,14 @@ int main(int argc, char **argv) {
     }
     if (config.rate_profile == RATE_PROFILE_REBUILD) {
         std::fprintf(stderr,
-            "Rebuild profile enabled: base %dx%d@%d, output %dx%d@%d, semantic/reference UDP %d, combined physical ceiling %d bps\n",
+            "Rebuild profile enabled: base %dx%d@%d, output %dx%d@%d, semantic/reference UDP %d, combined physical ceiling %d bps, reference soft/hard/guard %d/%d/%d ms\n",
             config.encoder.width, config.encoder.height, config.encoder.fps,
             config.transport.rebuild.output_width, config.transport.rebuild.output_height,
             config.transport.rebuild.output_fps, config.transport.rebuild.udp_port,
-            config.transport.pacing_bitrate_bps);
+            config.transport.pacing_bitrate_bps,
+            config.transport.rebuild.patch_soft_refresh_ms,
+            config.transport.rebuild.patch_hard_deadline_ms,
+            config.transport.rebuild.patch_refresh_guard_ms);
     }
     if (config.transport.mode == TRANSPORT_MODE_IMAGE) {
         std::fprintf(stderr,
@@ -723,7 +728,14 @@ int main(int argc, char **argv) {
                         "audio_dtx_drop=%llu audio_dtx_hold=%llu audio_dtx_speech=%llu "
                         "audio_dtx_keepalive=%llu rebuild_state=%llu rebuild_refs=%llu "
                         "rebuild_patch_packets=%llu rebuild_parity=%llu rebuild_jpeg_bytes=%llu "
-                        "rebuild_wire_bytes=%llu rebuild_q=%zu event_packets=%llu event_heartbeat=%llu "
+                        "rebuild_wire_bytes=%llu rebuild_q=%zu rebuild_refgen=%u "
+                        "rebuild_ref_capture_us=%llu rebuild_ref_encode_us=%llu "
+                        "rebuild_ref_queue_us=%llu rebuild_ref_first_send_us=%llu "
+                        "rebuild_ref_last_send_us=%llu rebuild_ref_q_delay_us=%llu "
+                        "rebuild_ref_capture_send_us=%llu rebuild_ref_capture_p50_us=%llu "
+                        "rebuild_ref_capture_p95_us=%llu rebuild_ref_bytes=%llu "
+                        "rebuild_ref_chunks=%llu rebuild_ref_fec_bytes=%llu "
+                        "event_packets=%llu event_heartbeat=%llu "
                         "event_replace=%llu event_wire_bytes=%llu event_mask=0x%04x event_q=%zu\n",
                         statistics.logLine().c_str(), tx.queued_bytes,
                         static_cast<unsigned long long>(tx.dropped_p_frames),
@@ -757,6 +769,19 @@ int main(int argc, char **argv) {
                         static_cast<unsigned long long>(rebuild_tx.patch_jpeg_bytes),
                         static_cast<unsigned long long>(rebuild_tx.sent_wire_bytes),
                         rebuild_tx.queued_requests,
+                        static_cast<unsigned int>(rebuild_tx.last_reference_generation),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_capture_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_encode_finish_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_queue_enter_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_first_packet_send_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_last_packet_send_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_queue_delay_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_capture_to_send_us),
+                        static_cast<unsigned long long>(rebuild_tx.reference_capture_to_send_p50_us),
+                        static_cast<unsigned long long>(rebuild_tx.reference_capture_to_send_p95_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_blob_bytes),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_chunk_count),
+                        static_cast<unsigned long long>(rebuild_tx.last_reference_fec_bytes),
                         static_cast<unsigned long long>(event_tx.state_packets),
                         static_cast<unsigned long long>(event_tx.heartbeat_packets),
                         static_cast<unsigned long long>(event_tx.replaced_events),

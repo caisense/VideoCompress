@@ -142,7 +142,7 @@ PC 默认文字输出为“`2个人出现`”“`当前检测到1辆车`”“`�
 目标 28 kbps），同时把 YOLOv8-Seg 目标状态及少量原相机 ROI 参考通过 `RB/1` 伴随通道
 发送到 UDP `5009`。PC 将基础层用 Lanczos4 放大，在分割掩码内异步使用可选
 Real-ESRGAN 目标块，并以 PTS 校准、内容配准、EMA 等比几何、核心区全融合、尺度自适应羽化和
-`1.0 s` 参考过期保护贴回，最终在旋转前
+独立的 `1000 ms` 缓存 TTL / `450 ms` 内容硬时效保护贴回，最终在旋转前
 输出 **640×360 @ 12 fps**。诊断目标框默认不绘制；只有显式传入
 `--rebuild-boxes=on` 才会显示框和标签。
 
@@ -172,14 +172,19 @@ H.265、RB/1 状态/参考和 ROEV/1 检测事件使用同一个视频侧 `RateP
 是含以太网/IP/UDP/RTP 开销的 A/V **组合上限**，不是每个端口各 100 kbps。每次处理先发
 当前 STATE，再发送最多两个待传参考数据报；大 JPEG 不再一次占住发送线程并令状态停更。
 参考传输先发 XOR parity、再渐进发送数据分片，完整传输在最后一个数据分片结束，不会因迟到
-parity 产生伪未完成任务。参考图只保留最新任务，默认长边不超过 128、JPEG 质量 72、JPEG
-最大 1600 B、1100 B 分片、每源帧最多 2 个分片、同一目标最短 `700 ms` 刷新。多个目标的参考传输会均匀错开，并用
-一个 XOR 校验分片恢复任意一个丢失数据分片。每个 RB/1 包都带源 PTS、帧号、档位代次和 CRC32。
+parity 产生伪未完成任务。参考图只保留最新任务，默认长边不超过 96、JPEG 质量 50、JPEG
+最大 800 B、1100 B 分片、每源帧最多 2 个分片；这一组合让通常的 rebuild crop 落在一个数据分片内，
+超大参考仍由 XOR/FEC 保护。参考刷新不是固定周期：默认软阈值为 `220 ms`、
+硬时限为 `450 ms`、保护提前量为 `75 ms`，发送端按参考大小、FEC、共享令牌桶和已观测 P95
+传输耗时计算下一次启动时刻；多个目标按最老参考优先错开。一个 XOR 校验分片可恢复任意一个丢失数据分片。
+每个 RB/1 包都带源 PTS、帧号、档位代次和 CRC32。
 
 接收端先用**有界 FIFO**把完整 RTP 访问单元按解码顺序交给 BMP 输出，再以最近状态的滑动中位数估计固定 PTS
 偏移（`BIAS`）；校准后的时间戳严格按 H.265 RTP 的 90 kHz 时间戳选择最近语义 PTS，只有绝对偏差不超过
-`100 ms` 才允许贴 ROI。窗口内对同轨迹框做有限线性外推，无解码 PTS、代次不一致或超窗时均退化为纯基础层。目标 STATE
-还必须显式声明当前参考可用，且其 `reference_generation` 必须与完整收到的参考严格相等。
+`100 ms` 才允许贴 ROI；参考内容还必须满足 `reference_pts - video_pts <= 100 ms` 且
+`video_pts - reference_pts <= 450 ms`。窗口内对同轨迹框做有限线性外推，无解码 PTS、代次不一致或超窗时均退化为纯基础层。
+完整 PATCH 在 PC 通过 FEC、CRC、JPEG 和 mask 校验后立即成为 local-ready，不等待下一条 STATE 的 ready flag；
+STATE 只负责当前轨迹与几何，非零 `reference_generation` 仍须严格匹配。
 如果基础层被检测为中性灰度，参考块也先转为灰度再融合，避免出现“彩色目标悬浮在灰色背景”现象。
 参考分片额外携带参考时刻的 detector bbox，接收端先对当前框做 EMA，再按参考框到当前框的等比平移/缩放关系放置 crop；
 随后在预测位置 ±8 px 内做内容相关配准，用峰值相关度作 fail-closed 闸门。中心位移超过 25% 或面积比超出 `[0.70,1.40]` 时拒绝贴图。
@@ -190,7 +195,8 @@ mask 采样为 64×64；发送端和 PC 接收端必须使用同一版本。
 12 fps 默认由 6 fps 解码帧交替显示新帧和 `HOLD` 帧，不使用会产生双影的线性插帧；所以它
 提高显示刷新稳定性，不会伪造额外运动细节。HUD 会明确显示 `DECODED`/`HOLD`、空间处理来源、
 HOLD 比例、`ROI AREA`、校准后 `PTS SYNC` 与 `BIAS`、参考 `PTSAGE`/墙钟年龄、`REGDROP`/`MATCHDROP`、
-`CHROMA`、RB/1 码率和 XOR 恢复数。
+`CHROMA`、RB/1 码率、XOR 恢复数、`AGEDROP/FUTURE/TIMINGDROP` 和 SR 的
+`RUN/Q/DONE/X/STALE`。
 
 Real-ESRGAN 只在 Windows PC 上处理小 ROI，RK3588 部署包不需要 ONNX Runtime。当前
 PC 有 NVIDIA GPU 时，优先安装 CUDA 档；CPU 档仅作为无 NVIDIA GPU 时的回退。两种 ONNX Runtime
@@ -222,10 +228,10 @@ python tools\live_h265_hud.py runs\live.sdp `
 `SR Real-ESRGAN/CUDA` 表示 GPU 已实际加载。若 CUDA 运行库不可用，程序自动回退到
 `CPUExecutionProvider` 或 Lanczos4，不会中断 H.265 接收。`FRAME ...+ROI-ESRGAN` 表示该帧实际用了缓存的超分 ROI；
 刚收到新参考时先显示
-`ROI-LANCZOS`、异步任务完成后再切换为 `ROI-ESRGAN` 属于正常行为；接收端会在 RB/1 参考
-**完整收齐的当刻**就提交后台超分，不再等到该参考通过最终 STATE/PTS 贴图检查才启动。最终贴图
-仍必须通过 generation、reference_generation、PTS 和内容配准闸门，因此这项预热不会放宽防重影
-安全边界；没有目标时只显示基础层。
+`ROI-LANCZOS`；异步任务完成后只允许在**下一个 source frame**切换为 `ROI-ESRGAN`，同一
+source sequence 的显示 tick 始终复用已合成像素。接收端会在 RB/1 参考**完整收齐的当刻**提交后台超分，
+不再等到下一条 STATE 才启动；最终贴图仍必须通过 generation、reference_generation、PTS、450 ms 内容时效和
+内容配准闸门，因此这项预热不会放宽防重影安全边界；没有目标时只显示基础层。
 超分结果按 `(generation, track_id, reference_generation)` 缓存为模型原生 x2 尺寸，当前框尺寸变化只做
 Lanczos 重采样，不会因检测框抖动重复提交 ONNX 推理。若模型或 ONNX Runtime 不可用，程序会自动回退
 Lanczos4，并在 HUD 的 `SR` 字段如实标明。GPU 只加速 PC 的 ROI 超分，不改变板端 H.265 编码、
@@ -234,7 +240,7 @@ UDP 限速或基础视频帧率。
 **本机实测（RTX 3060 Laptop GPU，2026-08-27）**：对动态模型的 `105×128 -> 210×256`
 ROI，CUDA 端到端超分中位数为 `93.13 ms`（P95 `105.60 ms`）；同样输入、CPU 两线程为
 `889.40 ms`（P95 `1097.76 ms`），约快 `9.55×`。首次加载 CUDA 模型及一次代表动态尺寸预热在
-后台完成；预热完成前参考安全地保留为 Lanczos，不会把首个 GPU 推理塞进 1 s 的参考 PTS 窗口。
+后台完成；预热完成前参考安全地保留为 Lanczos，不会把首个 GPU 推理塞进 450 ms 的参考 PTS 窗口。
 由于 SR 仍只处理小 ROI，GPU 不会改变基础层 H.265 或网络时延。
 
 普通 FFplay/GStreamer 仍能接收 UDP `5004` 的标准 H.265，但只能看到 256×144 @ 6 fps
@@ -403,7 +409,7 @@ flowchart TD
 ### rebuild 档：按屏幕从上到下的顺序
 
 下表与 `tools/live_h265_hud.py` 的实际绘制顺序一致。例如截图中的
-`REF 1/1 AGE 675ms PTSAGE +1000ms ...` 是一整行，不是四个独立的 HUD
+`REF 1/1 AGE 275ms PTSAGE +150ms ...` 是一整行，不是四个独立的 HUD
 模块。除明确标为“累计”的计数外，帧率、码率、PPS 和 L/A/M 均统计最近 1 秒。
 
 | 顺序 | HUD 显示示例 | 含义与判断方法 |
@@ -422,12 +428,12 @@ flowchart TD
 | 12 | `OUT 640x360 @12 fps` | PC 合成器的目标输出规格。旋转显示后窗口宽高会交换，但这里仍以旋转前视频坐标说明。 |
 | 13 | `FRAME HOLD+ROI-LANCZOS` | 本次输出来源。`DECODED` 表示使用刚解码的新源帧；`HOLD` 表示 12 Hz 展示复用上一解码帧。后缀 `BASE-LANCZOS`=没有有效参考，`ROI-LANCZOS`=贴了参考但尚未使用 SR 缓存，`ROI-ESRGAN`=贴了已完成的 Real-ESRGAN ROI。 |
 | 14 | `TEMP HOLD 49.9% (6->12)` | 当前 generation 开始以来由 `HOLD` 构成的输出占比；`6->12` 表示源 fps 到显示 fps。稳定 6→12 时通常约 50%。 |
-| 15 | `REF 1/1 AGE 675ms PTSAGE +1000ms REGDROP 0 MATCHDROP 0` | 第一个 `REF` 是本帧实际贴用的参考数，第二个是当前完整缓存的参考数。`AGE` 从参考在 PC 收齐开始计的墙钟年龄；`PTSAGE` 是参考拍摄 PTS 相对当前基础视频的内容年龄，正数表示参考更旧，接近 `+1000ms` 已到默认安全边界。`REGDROP` 是本帧几何/配准拒绝数，`MATCHDROP` 是其中内容相关度闸门拒绝数；两者非 0 时该目标回退为基础层。 |
+| 15 | `REF 1/1 AGE 275ms PTSAGE +150ms REGDROP 0 MATCHDROP 0` | 第一个 `REF` 是本帧实际贴用的参考数，第二个是当前完整缓存的参考数。`AGE` 从参考在 PC 收齐开始计的墙钟年龄；`PTSAGE` 是参考拍摄 PTS 相对当前基础视频的内容年龄，正数表示参考更旧，必须 `<=+450ms`；参考对象最多在缓存保留 `1000ms`，但 TTL 不延长内容有效期。`REGDROP` 是本帧几何/配准拒绝数，`MATCHDROP` 是其中内容相关度闸门拒绝数；两者非 0 时该目标回退为基础层。 |
 | 16 | `ROI AREA 13.8%` | 当前输出像素中被有效参考掩码实际覆盖的比例；它不是 YOLO 框面积。0% 表示本帧只显示基础层。 |
 | 17 | `PTS SYNC +0ms BIAS -1ms DROP#0` | `SYNC` 为校准后所选语义 STATE PTS 减当前解码视频 PTS；绝对值必须不超过 100 ms，超窗会附加 `DROP` 并禁止贴参考。`BIAS` 是 FIFO 配对后从滑动中位数得到的稳定解码时钟偏移；`DROP#` 是启动以来累计的 PTS 拒绝帧数。 |
 | 18 | `CHROMA COLOR BOX OFF` | `CHROMA` 是基础层色彩判定；`MONO` 时参考也会转灰度，避免彩色贴片悬浮。`BOX` 是诊断框开关，生产展示默认 `OFF`。 |
 | 19 | `FEC 38 INC 0 BAD 0` | `FEC` 是累计由 XOR parity 成功恢复的参考传输数；`INC` 是当前仍未收齐的参考传输数；`BAD` 是累计无效、CRC/格式异常或分片元数据不一致的数量。 |
-| 20 | `SR Real-ESRGAN/CUDA 23/24 P1 S0` | `SR` 后为当前超分模型与实际后端（可为 `CUDA`、`CPU` 等）；它会在首次推理后复核后端，CUDA 失败并退回 CPU 时不会误报 CUDA。`23/24` 是已完成/已提交的 ROI 超分任务累计数；`P1` 表示有 1 个后台超分任务仍在运行，**不是 P 帧**；`S0` 是后台超分结果不可用（取消、异常或未能取回）的累计数。 |
+| 20 | `SR Real-ESRGAN/CUDA RUN 1 Q 0 DONE 23/24 X 1 STALE 0` | `SR` 后为当前超分模型与实际后端（可为 `CUDA`、`CPU` 等）；`RUN` 表示运行中的任务数（最多 1），`Q` 是 latest-only pending 数（最多 1），`DONE/JOBS` 是已完成/已提交任务累计数，`X` 是提交前因内容年龄超过硬时限而拒绝的累计数，`STALE` 是完成后因代次、轨迹、时效或异常而丢弃的累计数；SR future 拒绝另计在 composer snapshot 的 `sr_future_drops`。 |
 | 21 | `Source age 123 ms Last IDR 0.4s ago` | `Source age` 是当前显示所依据的最近解码源帧在 PC 内的年龄，不是端到端网络延迟；`Last IDR` 是距最近完整 IDR/关键访问单元到达的时间。长期不出现 IDR 会降低断流后的恢复速度。 |
 
 ### 非 rebuild 档

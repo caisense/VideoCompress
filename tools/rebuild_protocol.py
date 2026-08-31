@@ -214,7 +214,8 @@ def parse_fragment(payload: bytes) -> PatchFragment:
     fragment = PatchFragment(*values, payload[FRAGMENT_HEADER_BYTES:])
     expected_fragments = ((fragment.blob_size + fragment.chunk_bytes - 1) //
                           fragment.chunk_bytes) if fragment.chunk_bytes else 0
-    if (fragment.track_id == 0 or fragment.data_fragments == 0 or
+    if (fragment.track_id == 0 or fragment.reference_generation == 0 or
+            fragment.data_fragments == 0 or
             fragment.fragment_index > fragment.data_fragments or
             fragment.chunk_bytes == 0 or len(fragment.data) > fragment.chunk_bytes or
             fragment.blob_size == 0 or fragment.mask_rle_bytes > fragment.blob_size or

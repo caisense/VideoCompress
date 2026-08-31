@@ -22,7 +22,15 @@ import numpy as np
 _TOOLS_DIR = str(Path(__file__).resolve().parent)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
-from rebuild_receiver import RebuildComposer, RebuildReceiver, SuperResolver
+from rebuild_receiver import (
+    REFERENCE_CACHE_TTL_MS,
+    REFERENCE_CONTENT_HARD_MAX_AGE_MS,
+    REFERENCE_FUTURE_MAX_MS,
+    STATE_SYNC_MAX_MS,
+    RebuildComposer,
+    RebuildReceiver,
+    SuperResolver,
+)
 
 
 class RtpStats:
@@ -504,9 +512,16 @@ def main() -> int:
     parser.add_argument("--rebuild-width", type=int, default=640)
     parser.add_argument("--rebuild-height", type=int, default=360)
     parser.add_argument("--rebuild-fps", type=float, default=12.0)
-    parser.add_argument("--rebuild-reference-max-age", type=float, default=1.0)
-    parser.add_argument("--rebuild-max-sync-ms", type=int, default=100,
+    parser.add_argument("--rebuild-reference-cache-ttl-ms", type=int,
+                        default=REFERENCE_CACHE_TTL_MS)
+    parser.add_argument("--rebuild-reference-hard-age-ms", type=int,
+                        default=REFERENCE_CONTENT_HARD_MAX_AGE_MS)
+    parser.add_argument("--rebuild-reference-future-ms", type=int,
+                        default=REFERENCE_FUTURE_MAX_MS)
+    parser.add_argument("--rebuild-max-sync-ms", type=int, default=STATE_SYNC_MAX_MS,
                         help="suppress ROI paint when RB/1 state differs from video PTS")
+    parser.add_argument("--rebuild-debug-timing", action="store_true",
+                        help="emit one structured timing record per composed source frame")
     parser.add_argument("--esrgan", choices=("auto", "off"), default="auto",
                         help="small-ROI Real-ESRGAN; auto falls back to Lanczos4")
     parser.add_argument("--esrgan-model", default=None)
@@ -518,8 +533,9 @@ def main() -> int:
     args = parser.parse_args()
     if (args.width <= 0 or args.height <= 0 or args.scale < 0 or
             args.rebuild_width <= 0 or args.rebuild_height <= 0 or
-            args.rebuild_fps <= 0 or args.rebuild_reference_max_age <= 0 or
-            args.rebuild_max_sync_ms <= 0 or
+            args.rebuild_fps <= 0 or args.rebuild_reference_cache_ttl_ms <= 0 or
+            args.rebuild_reference_hard_age_ms <= 0 or
+            args.rebuild_reference_future_ms <= 0 or args.rebuild_max_sync_ms <= 0 or
             args.esrgan_threads < 0):
         parser.error("dimensions/rates/ages must be positive and scale/threads non-negative")
 
@@ -534,13 +550,17 @@ def main() -> int:
     if rebuild_port < 1 or rebuild_port > 65535 or rebuild_port == listen_port:
         parser.error("rebuild port must be a valid UDP port distinct from video RTP")
     rebuild_receiver = RebuildReceiver(
-        rebuild_port, max_sync_ms=args.rebuild_max_sync_ms)
+        rebuild_port, max_sync_ms=args.rebuild_max_sync_ms,
+        reference_cache_ttl_ms=args.rebuild_reference_cache_ttl_ms,
+        reference_future_max_ms=args.rebuild_reference_future_ms)
     resolver = SuperResolver(
         enabled=False, model_path=args.esrgan_model,
         cpu_threads=args.esrgan_threads)
     rebuild_composer = RebuildComposer(
         output_size=(args.rebuild_width, args.rebuild_height), resolver=resolver,
-        reference_max_age=args.rebuild_reference_max_age,
+        reference_cache_ttl_ms=args.rebuild_reference_cache_ttl_ms,
+        reference_content_hard_max_age_ms=args.rebuild_reference_hard_age_ms,
+        reference_future_max_ms=args.rebuild_reference_future_ms,
         draw_targets=args.rebuild_boxes == "on")
     presentation = PresentationStats()
     try:
@@ -688,6 +708,7 @@ def main() -> int:
     current_canvas: Optional[np.ndarray] = None
     current_updated = 0.0
     current_source_sequence: Optional[int] = None
+    current_spatial = "BASE-LANCZOS"
     current_mode = "normal"
     try:
         while not stopping.is_set():
@@ -702,17 +723,33 @@ def main() -> int:
             if current_mode != ("rebuild" if is_rebuild else "normal"):
                 current_canvas = None
                 current_source_sequence = None
+                current_spatial = "BASE-LANCZOS"
                 next_rebuild_present = now
                 current_mode = "rebuild" if is_rebuild else "normal"
                 if is_rebuild and args.esrgan != "off":
                     resolver.enable_async()
 
-            # A completed RB/1 reference reaches this queue on the socket
-            # thread.  Give Real-ESRGAN the crop immediately; do not wait for
-            # the 12 fps renderer to find a STATE/PTS-valid moment to paint
-            # it.  The compositor still applies all existing fail-closed
-            # generation, STATE, PTS and registration checks at blend time.
             if is_rebuild:
+                profile_generation = int(profile["generation"])
+                timing_values = rebuild_receiver.snapshot()
+                timing_state, timing_generation, _, _ = rebuild_receiver.scene()
+                active_track_ids = set()
+                advertised_generations = {}
+                if timing_state is not None and timing_generation == profile_generation:
+                    active_track_ids = {
+                        target.track_id for target in timing_state.targets
+                    }
+                    advertised_generations = {
+                        target.track_id: target.reference_generation
+                        for target in timing_state.targets
+                    }
+                rebuild_composer.update_timing(
+                    source_rtp_timestamp, timing_values["pts_bias_ms"],
+                    profile_generation, active_track_ids,
+                    advertised_generations)
+                # A complete RB/1 reference reaches this queue on the socket
+                # thread.  Prefetch it immediately; it can only affect a
+                # later source frame because the current composition is cached.
                 for reference in rebuild_receiver.take_completed_references():
                     rebuild_composer.prefetch(reference)
                 rebuild_composer.prefetch_pending()
@@ -722,23 +759,47 @@ def main() -> int:
                 skipped = max(0, int((now - next_rebuild_present) / interval))
                 next_rebuild_present += (skipped + 1) * interval
                 if frame is not None:
-                    base = frame
-                    if args.denoise == "on":
-                        base = cv2.bilateralFilter(base, 5, 24.0, 24.0)
-                    state, state_generation, references, _, sync_ms = \
-                        rebuild_receiver.scene_synced(source_rtp_timestamp)
                     profile_generation = int(profile["generation"])
-                    if state_generation != profile_generation:
-                        state, references = None, {}
-                    receiver_sync = rebuild_receiver.snapshot()
-                    rebuilt, spatial = rebuild_composer.render(
-                        base, state, profile_generation, references, now,
-                        video_rtp_timestamp=source_rtp_timestamp,
-                        pts_bias_ms=receiver_sync["pts_bias_ms"])
-                    current_canvas = postprocess_frame(rebuilt, args.rotate, False)
-                    current_updated = updated
-                    current_source_sequence = source_sequence
-                    presentation.present(source_sequence, spatial,
+                    if source_sequence != current_source_sequence:
+                        base = frame
+                        if args.denoise == "on":
+                            base = cv2.bilateralFilter(base, 5, 24.0, 24.0)
+                        state, state_generation, references, _, sync_ms = \
+                            rebuild_receiver.scene_synced(source_rtp_timestamp)
+                        if state_generation != profile_generation:
+                            state, references = None, {}
+                        receiver_sync = rebuild_receiver.snapshot()
+                        rebuilt, spatial = rebuild_composer.render(
+                            base, state, profile_generation, references, now,
+                            video_rtp_timestamp=source_rtp_timestamp,
+                            pts_bias_ms=receiver_sync["pts_bias_ms"],
+                            source_sequence=source_sequence)
+                        current_canvas = postprocess_frame(rebuilt, args.rotate, False)
+                        current_updated = updated
+                        current_source_sequence = source_sequence
+                        current_spatial = spatial
+                        if args.rebuild_debug_timing:
+                            debug_values = rebuild_composer.snapshot()
+                            bias = receiver_sync["pts_bias_ms"]
+                            video_pts_ms = (None if source_rtp_timestamp is None else
+                                             int(((source_rtp_timestamp + bias * 90) &
+                                                  0xffffffff) / 90))
+                            match_text = ("none" if debug_values["match_score"] is None else
+                                          f"{debug_values['match_score']:.2f}")
+                            print(
+                                f"SEQ={source_sequence} "
+                                f"VPTS={'none' if video_pts_ms is None else video_pts_ms} "
+                                f"SPTS={'none' if receiver_sync['state_pts_ms'] is None else receiver_sync['state_pts_ms']} "
+                                f"RPTS={'none' if debug_values['reference_pts_ms'] is None else debug_values['reference_pts_ms']} "
+                                f"AGE={'none' if debug_values['reference_content_age_ms'] is None else debug_values['reference_content_age_ms']} "
+                                f"GEN={profile_generation} "
+                                f"RGEN={'none' if debug_values['reference_generation'] is None else debug_values['reference_generation']} "
+                                f"READY={'LOCAL' if debug_values['refs_used'] else 'BASE'} "
+                                f"MODE={spatial} "
+                                f"MATCH={match_text} "
+                                f"SR={'HIT' if spatial == 'ROI-ESRGAN' else 'MISS'}",
+                                flush=True)
+                    presentation.present(source_sequence, current_spatial,
                                          profile_generation, now)
             elif not is_rebuild:
                 if frame is not None and current_source_sequence != source_sequence:
@@ -781,6 +842,7 @@ def main() -> int:
                             f" rb_pkt_avg_B={rebuild_values['packet_avg_bytes']:.0f}"
                             f" refs={composer_values['refs_used']}/"
                             f"{rebuild_values['active_references']}"
+                            f" agedrop={composer_values['age_drops']}"
                             f" reg_drops={composer_values['registration_drops']}"
                             f" content_drops={composer_values['content_drops']}"
                             f" rebuild_area={composer_values['rebuild_percent']:.1f}%"
@@ -788,6 +850,12 @@ def main() -> int:
                             f" pts_sync_ms={'none' if sync_ms is None else sync_ms}"
                             f" pts_bias_ms={rebuild_values['pts_bias_ms']}"
                             f" ref_pts_age_ms={composer_values['reference_content_age_ms']}"
+                            f" gen={profile['generation']}/"
+                            f"{composer_values['reference_generation']}"
+                            f" sr_run={int(composer_values['sr_running'])}"
+                            f" sr_q={composer_values['sr_queue']}"
+                            f" sr_x={composer_values['sr_x']}"
+                            f" sr_stale={composer_values['sr_stale']}"
                             f" sync_drops={rebuild_values['sync_drops']}"
                             f" fec_recovered={rebuild_values['parity_recovered']}"
                         )
@@ -860,9 +928,13 @@ def main() -> int:
                     f"REF {composer_values['refs_used']}/"
                     f"{rebuild_values['active_references']} AGE {ref_age_text} "
                     f"PTSAGE {ref_pts_age_text} "
+                    f"AGEDROP {composer_values['age_drops']} "
                     f"REGDROP {composer_values['registration_drops']} "
                     f"MATCHDROP {composer_values['content_drops']}",
                     f"ROI AREA {composer_values['rebuild_percent']:.1f}%",
+                    f"GEN {profile['generation']}/{composer_values['reference_generation']} "
+                    f"FUTURE {composer_values['future_drops']} "
+                    f"TIMINGDROP {composer_values['timing_drops']}",
                     f"PTS SYNC {sync_text} BIAS {rebuild_values['pts_bias_ms']:+d}ms "
                     f"DROP#{rebuild_values['sync_drops']}",
                     f"CHROMA {composer_values['chroma_mode']} "
@@ -871,9 +943,11 @@ def main() -> int:
                     f"INC {rebuild_values['incomplete']} BAD "
                     f"{rebuild_values['invalid'] + rebuild_values['inconsistent']}",
                     f"SR {composer_values['sr_model'][:24]} "
-                    f"{composer_values['sr_done']}/{composer_values['sr_jobs']} "
-                    f"P{1 if composer_values['sr_pending'] else 0} "
-                    f"S{composer_values['sr_stale']}",
+                    f"RUN {int(composer_values['sr_running'])} "
+                    f"Q {composer_values['sr_queue']} "
+                    f"DONE {composer_values['sr_done']}/{composer_values['sr_jobs']} "
+                    f"X {composer_values['sr_x']} "
+                    f"STALE {composer_values['sr_stale']}",
                 ]
             else:
                 lines = [

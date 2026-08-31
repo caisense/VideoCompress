@@ -76,7 +76,9 @@ struct RebuildConfig {
     int patch_max_side;
     int patch_jpeg_quality;
     int patch_max_bytes;
-    int patch_refresh_ms;
+    int patch_soft_refresh_ms;
+    int patch_hard_deadline_ms;
+    int patch_refresh_guard_ms;
     int patch_chunk_bytes;
     int patch_packets_per_frame;
     int crop_margin_percent;

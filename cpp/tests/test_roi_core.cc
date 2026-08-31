@@ -300,8 +300,34 @@ void testCommandLineConfig() {
     CHECK(rebuild.transport.rebuild.output_width == 640);
     CHECK(rebuild.transport.rebuild.output_height == 360);
     CHECK(rebuild.transport.rebuild.output_fps == 12);
+    CHECK(rebuild.transport.rebuild.patch_max_side == 96);
+    CHECK(rebuild.transport.rebuild.patch_jpeg_quality == 50);
+    CHECK(rebuild.transport.rebuild.patch_max_bytes == 800);
+    CHECK(rebuild.transport.rebuild.patch_soft_refresh_ms == 220);
+    CHECK(rebuild.transport.rebuild.patch_hard_deadline_ms == 450);
+    CHECK(rebuild.transport.rebuild.patch_refresh_guard_ms == 75);
     CHECK(!rebuild.encoder.grayscale_encode);
     CHECK(std::string(roi_h265::rateProfileName(rebuild.rate_profile)) == "rebuild");
+
+    char rebuild_soft_refresh[] = "--rebuild-reference-soft-refresh-ms=180";
+    char rebuild_hard_deadline[] = "--rebuild-reference-hard-deadline-ms=450";
+    char rebuild_refresh_guard[] = "--rebuild-reference-refresh-guard-ms=60";
+    char *rebuild_timing_argv[] = {profile_app, profile_rebuild, rebuild_soft_refresh,
+                                   rebuild_hard_deadline, rebuild_refresh_guard};
+    AppConfig rebuild_timing;
+    error.clear();
+    CHECK(roi_h265::parseAppConfig(5, rebuild_timing_argv, &rebuild_timing, &error));
+    CHECK(rebuild_timing.transport.rebuild.patch_soft_refresh_ms == 180);
+    CHECK(rebuild_timing.transport.rebuild.patch_hard_deadline_ms == 450);
+    CHECK(rebuild_timing.transport.rebuild.patch_refresh_guard_ms == 60);
+
+    char rebuild_bad_soft_refresh[] = "--rebuild-reference-soft-refresh-ms=450";
+    char *rebuild_bad_timing_argv[] = {profile_app, profile_rebuild,
+                                       rebuild_bad_soft_refresh};
+    AppConfig rebuild_bad_timing;
+    error.clear();
+    CHECK(!roi_h265::parseAppConfig(3, rebuild_bad_timing_argv, &rebuild_bad_timing,
+                                    &error));
 
     char rebuild_override[] = "--encoder-width=320";
     char *invalid_rebuild_argv[] = {profile_app, profile_rebuild, rebuild_override};

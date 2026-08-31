@@ -22,6 +22,12 @@ import numpy as np
 import rebuild_protocol as rb
 
 
+REFERENCE_CACHE_TTL_MS = 1000
+REFERENCE_CONTENT_HARD_MAX_AGE_MS = 450
+REFERENCE_FUTURE_MAX_MS = 100
+STATE_SYNC_MAX_MS = 100
+
+
 def wire_bytes(udp_payload_bytes: int) -> int:
     return 38 + max(46, udp_payload_bytes + 28)
 
@@ -79,21 +85,33 @@ class VisualReference:
 
 
 class RebuildReceiver:
-    def __init__(self, port: int = 5009, max_sync_ms: int = 100) -> None:
+    def __init__(self, port: int = 5009, max_sync_ms: int = STATE_SYNC_MAX_MS,
+                 reference_cache_ttl_ms: int = REFERENCE_CACHE_TTL_MS,
+                 reference_future_max_ms: int = REFERENCE_FUTURE_MAX_MS) -> None:
         if max_sync_ms <= 0:
             raise ValueError("RB/1 maximum PTS sync error must be positive")
+        if reference_cache_ttl_ms <= 0 or reference_future_max_ms <= 0:
+            raise ValueError("RB/1 reference cache/future limits must be positive")
         self.port = port
         self.max_sync_ms = max_sync_ms
+        self.reference_cache_ttl_ms = reference_cache_ttl_ms
+        self.reference_future_max_ms = reference_future_max_ms
         self.lock = threading.Lock()
         self.assembler = rb.FragmentAssembler()
         self.state: Optional[rb.StateRecord] = None
         self.state_generation: Optional[int] = None
         self.state_updated = 0.0
         self.state_pts_ms: Optional[int] = None
+        self.last_selected_state_pts_ms: Optional[int] = None
         self.state_sequence: Optional[int] = None
         self.state_history: Deque[Tuple[int, int, rb.StateRecord, float]] = \
             collections.deque(maxlen=32)
         self.references: Dict[int, VisualReference] = {}
+        # A complete PATCH is local-ready immediately.  This floor is kept
+        # separately from STATE flags so a late semantic packet cannot make a
+        # valid local reference appear unavailable or move its generation back.
+        self.reference_generations: Dict[int, int] = {}
+        self.state_reference_generations: Dict[int, int] = {}
         # ``on_datagram`` runs on the RB/1 socket thread while composition
         # runs on the UI thread.  A completed reference must be handed to the
         # compositor immediately, rather than waiting until a future video
@@ -113,6 +131,7 @@ class RebuildReceiver:
         self.complete_references = 0
         self.parity_recovered = 0
         self.sync_drops = 0
+        self.reference_generation_drops = 0
         self._last_sync_drop_timestamp: Optional[int] = None
         # A decoder/output handoff can introduce a stable presentation offset
         # (for example one 6-fps source frame).  Keep a robust sliding estimate
@@ -135,6 +154,52 @@ class RebuildReceiver:
     def _newer_u8(value: int, previous: int) -> bool:
         delta = (value - previous) & 0xFF
         return 0 < delta < 0x80
+
+    @staticmethod
+    def _newer_u16(value: int, previous: int) -> bool:
+        delta = (value - previous) & 0xFFFF
+        return 0 < delta < 0x8000
+
+    @classmethod
+    def _at_least_u16(cls, value: int, previous: int) -> bool:
+        return value == previous or cls._newer_u16(value, previous)
+
+    def _prune_references(self, now: float) -> None:
+        cutoff = now - self.reference_cache_ttl_ms / 1000.0
+        self.references = {
+            track_id: reference for track_id, reference in self.references.items()
+            if reference.received_at >= cutoff
+        }
+        self.completed_reference_events = collections.deque(
+            (reference for reference in self.completed_reference_events
+             if reference.received_at >= cutoff), maxlen=4)
+
+    def _state_reference_generations_are_valid(self, state: rb.StateRecord) -> bool:
+        for target in state.targets:
+            previous = self.state_reference_generations.get(target.track_id)
+            if target.reference_generation == 0:
+                # Zero is only the initial "not advertised yet" placeholder.
+                # Once a non-zero generation has been published, a later zero
+                # STATE is a semantic rollback even if its packet sequence is
+                # newer because it came through a delayed producer queue.
+                if previous is not None:
+                    return False
+                continue
+            local = self.reference_generations.get(target.track_id)
+            for floor in (previous, local):
+                if (floor is not None and target.reference_generation != floor and
+                        not self._newer_u16(target.reference_generation, floor)):
+                    return False
+        return True
+
+    def _record_state_reference_generations(self, state: rb.StateRecord) -> None:
+        for target in state.targets:
+            if target.reference_generation == 0:
+                continue
+            previous = self.state_reference_generations.get(target.track_id)
+            if (previous is None or target.reference_generation == previous or
+                    self._newer_u16(target.reference_generation, previous)):
+                self.state_reference_generations[target.track_id] = target.reference_generation
 
     def on_datagram(self, data: bytes, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
@@ -160,6 +225,8 @@ class RebuildReceiver:
                     return
                 self.state = None
                 self.references.clear()
+                self.reference_generations.clear()
+                self.state_reference_generations.clear()
                 self.completed_reference_events.clear()
                 self.state_history.clear()
                 self.state_updated = 0.0
@@ -241,40 +308,65 @@ class RebuildReceiver:
                     self.state_sequence is None or
                     packet.sequence == self.state_sequence or
                     self._newer_u32(packet.sequence, self.state_sequence))
+                if accept_state and not self._state_reference_generations_are_valid(state):
+                    # A semantically older STATE is still an old reference
+                    # generation, even when its RB/1 packet sequence is newer
+                    # because it was emitted by a delayed producer queue.
+                    self.reference_generation_drops += 1
+                    accept_state = False
                 if accept_state:
+                    self._record_state_reference_generations(state)
                     self.state = state
                     self.state_updated = now
                     self.state_pts_ms = packet.pts_ms
                     self.state_sequence = packet.sequence
                     state_item = (packet.generation, packet.pts_ms, state, now)
-                    if (self.state_history and
-                            self.state_history[-1][0] == packet.generation and
-                            self.state_history[-1][1] == packet.pts_ms):
-                        self.state_history[-1] = state_item
-                    else:
-                        self.state_history.append(state_item)
-                    active = {target.track_id for target in state.targets}
-                    self.references = {
-                        track_id: reference for track_id, reference in self.references.items()
-                        if track_id in active and now - reference.received_at <= 5.0
-                    }
+                    # A completion STATE can share the source PTS with the
+                    # earlier flags=0 STATE, while PATCH fragments for that
+                    # reference and later states have already interleaved in
+                    # this history.  Replace every same-PTS snapshot so the
+                    # nearest-PTS lookup cannot tie-break back to stale
+                    # reference-generation metadata.
+                    self.state_history = collections.deque(
+                        (item for item in self.state_history
+                         if not (item[0] == packet.generation and
+                                 item[1] == packet.pts_ms)),
+                        maxlen=self.state_history.maxlen)
+                    self.state_history.append(state_item)
             if decoded_reference is not None:
                 existing = self.references.get(decoded_reference.track_id)
-                if (existing is None or
-                        decoded_reference.generation != existing.generation or
-                        decoded_reference.reference_generation >=
-                        existing.reference_generation):
+                local_generation = self.reference_generations.get(
+                    decoded_reference.track_id)
+                is_newer_than_local = (
+                    local_generation is None or
+                    decoded_reference.reference_generation == local_generation or
+                    self._newer_u16(decoded_reference.reference_generation,
+                                    local_generation))
+                is_newer_than_existing = (
+                    existing is None or
+                    decoded_reference.reference_generation == existing.reference_generation or
+                    self._newer_u16(decoded_reference.reference_generation,
+                                    existing.reference_generation))
+                if (decoded_reference.generation == self.state_generation and
+                        is_newer_than_local and is_newer_than_existing):
                     self.references[decoded_reference.track_id] = decoded_reference
+                    self.reference_generations[decoded_reference.track_id] = decoded_reference.reference_generation
                     self.completed_reference_events.append(decoded_reference)
                     self.complete_references += 1
                     if decoded_reference.recovered_with_parity:
                         self.parity_recovered += 1
+                elif (local_generation is not None and
+                      decoded_reference.reference_generation != local_generation and
+                      not self._newer_u16(decoded_reference.reference_generation,
+                                          local_generation)):
+                    self.reference_generation_drops += 1
             self._trim(now)
 
     def _trim(self, now: float) -> None:
         cutoff = now - 1.0
         while self.samples and self.samples[0][0] < cutoff:
             self.samples.popleft()
+        self._prune_references(now)
 
     def scene(self) -> Tuple[Optional[rb.StateRecord], int,
                              Dict[int, VisualReference], float]:
@@ -285,11 +377,11 @@ class RebuildReceiver:
     def take_completed_references(self) -> Tuple[VisualReference, ...]:
         """Return newly assembled crops once, for early asynchronous SR.
 
-        This deliberately does *not* declare a crop paintable.  The existing
-        generation, STATE flag, PTS and registration checks in ``render``
-        remain the only authority for blending it into a frame.  The event is
-        solely a head start for model-native upscaling while those checks and
-        the sender's next STATE are still in flight.
+        The event is already local-ready: the compositor may use its content
+        as soon as a valid current scene supplies geometry.  STATE flags are
+        deliberately not repeated as a second readiness gate; generation,
+        reference-generation, PTS, age, and registration checks still decide
+        whether the reference can be blended into a source frame.
         """
         with self.lock:
             events = tuple(self.completed_reference_events)
@@ -375,6 +467,7 @@ class RebuildReceiver:
             selected_state = None
             selected_updated = self.state_updated
             selected_delta = None
+            self.last_selected_state_pts_ms = None
             effective_video_rtp_timestamp = video_rtp_timestamp
             if video_rtp_timestamp is not None and self.state_history:
                 candidates = [item for item in self.state_history if item[0] == generation]
@@ -397,6 +490,7 @@ class RebuildReceiver:
                             effective_video_rtp_timestamp)))
                     selected_state = selected[2]
                     selected_updated = selected[3]
+                    self.last_selected_state_pts_ms = selected[1]
                     delta_ticks = self._signed_pts_delta(
                         (selected[1] * 90) & 0xFFFFFFFF,
                         effective_video_rtp_timestamp)
@@ -427,14 +521,15 @@ class RebuildReceiver:
                 return None, generation, {}, selected_updated, selected_delta
             self._last_sync_drop_timestamp = None
             references = dict(self.references)
-            # Do not paint a reference that is materially newer than the
-            # decoded base frame. Older references remain useful only while a
-            # current, PTS-bounded target state supplies their location.
+            # Reject only future references here.  The compositor owns the
+            # separate content hard-age decision so it can expose AGEDROP
+            # instead of silently turning an expired local-ready reference
+            # into an indistinguishable missing reference.
             references = {
                 track_id: reference for track_id, reference in references.items()
                 if self._signed_pts_delta(
                     (reference.pts_ms * 90) & 0xFFFFFFFF,
-                    effective_video_rtp_timestamp) <= self.max_sync_ms * 90
+                    effective_video_rtp_timestamp) >= -self.reference_future_max_ms * 90
             }
             return (selected_state, generation, references,
                     selected_updated, selected_delta)
@@ -469,10 +564,14 @@ class RebuildReceiver:
                 "expired": self.assembler.expired,
                 "inconsistent": self.assembler.inconsistent,
                 "sync_drops": self.sync_drops,
+                "reference_generation_drops": self.reference_generation_drops,
+                "reference_cache_ttl_ms": self.reference_cache_ttl_ms,
+                "reference_future_max_ms": self.reference_future_max_ms,
                 "max_sync_ms": self.max_sync_ms,
                 "pts_bias_ms": self.pts_bias_ms,
                 "pts_bias_samples": len(self.pts_bias_samples),
                 "raw_sync_ms": self.raw_sync_ms,
+                "state_pts_ms": self.last_selected_state_pts_ms,
                 "state_age": None if not self.state_updated else now - self.state_updated,
             }
 
@@ -715,36 +814,144 @@ class SuperResolver:
 class RebuildComposer:
     def __init__(self, output_size: Tuple[int, int] = (640, 360),
                  resolver: Optional[SuperResolver] = None,
-                 reference_max_age: float = 1.0, draw_targets: bool = False) -> None:
+                 reference_cache_ttl_ms: int = REFERENCE_CACHE_TTL_MS,
+                 reference_content_hard_max_age_ms: int =
+                 REFERENCE_CONTENT_HARD_MAX_AGE_MS,
+                 reference_future_max_ms: int = REFERENCE_FUTURE_MAX_MS,
+                 draw_targets: bool = False) -> None:
+        if (reference_cache_ttl_ms <= 0 or
+                reference_content_hard_max_age_ms <= 0 or
+                reference_future_max_ms <= 0):
+            raise ValueError("reference cache/content/future limits must be positive")
         self.output_size = output_size
         self.resolver = resolver or SuperResolver(enabled=False)
-        self.reference_max_age = reference_max_age
+        self.reference_cache_ttl_ms = reference_cache_ttl_ms
+        self.reference_content_hard_max_age_ms = reference_content_hard_max_age_ms
+        self.reference_future_max_ms = reference_future_max_ms
         self.draw_targets = draw_targets
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rebuild-roi-sr")
         self.future: Optional[Future] = None
         self.job_key: Optional[tuple] = None
+        self.job_reference: Optional[VisualReference] = None
         self.pending_reference: Optional[VisualReference] = None
+        self._known_references: Dict[Tuple[int, int], VisualReference] = {}
+        self._latest_video_rtp_timestamp: Optional[int] = None
+        self._latest_pts_bias_ms = 0
+        self._latest_generation: Optional[int] = None
+        self._active_track_ids: Optional[set] = None
+        self._advertised_reference_generations: Dict[int, int] = {}
         self.cache: Dict[tuple, np.ndarray] = {}
         self.sr_jobs = 0
         self.sr_done = 0
         self.sr_stale = 0
+        self.sr_expired_before_submit = 0
+        self.sr_expired_after_compute = 0
+        self.sr_future_drops = 0
+        self.sr_invalid_drops = 0
+        self.sr_pending_replaced = 0
         self.registration_drops = 0
         self.content_drops = 0
         self.content_matches = 0
+        self.age_drops = 0
+        self.future_drops = 0
+        self.timing_drops = 0
         self.last_refs_used = 0
         self.last_ref_age: Optional[float] = None
         self.last_ref_content_age_ms: Optional[int] = None
+        self.last_reference_pts_ms: Optional[int] = None
+        self.last_reference_generation: Optional[int] = None
         self.last_match_score: Optional[float] = None
         self.last_rebuild_percent = 0.0
         self.last_spatial = "BASE-LANCZOS"
         self.last_chroma_mode = "COLOR"
         self._smooth_boxes: Dict[tuple, Tuple[float, float, float, float]] = {}
         self._smooth_generation: Optional[int] = None
+        self._composed_source_sequence: Optional[int] = None
+        self._composed_generation: Optional[int] = None
+        self._composed_frame: Optional[np.ndarray] = None
+        self._composed_spatial = "BASE-LANCZOS"
+        self.composed_frames = 0
 
     @staticmethod
     def _reference_key(reference: VisualReference) -> tuple:
         return (reference.generation, reference.track_id,
                 reference.reference_generation)
+
+    def update_timing(self, video_rtp_timestamp: Optional[int],
+                      pts_bias_ms: int = 0, generation: Optional[int] = None,
+                      active_track_ids: Optional[set] = None,
+                      advertised_reference_generations: Optional[Dict[int, int]] = None
+                      ) -> None:
+        """Publish the immutable clock/scene context used by SR gates.
+
+        The UI thread updates this before polling or submitting work.  A
+        worker result is therefore checked against the newest known source
+        frame before it can enter the SR cache.
+        """
+        if (generation is not None and self._latest_generation is not None and
+                generation != self._latest_generation):
+            # A profile rollover invalidates all reference identities from the
+            # previous stream.  The bounded pixel cache is harmless but the
+            # newest-reference index must not grow across generations.
+            self._known_references.clear()
+        self._latest_video_rtp_timestamp = video_rtp_timestamp
+        self._latest_pts_bias_ms = pts_bias_ms
+        self._latest_generation = generation
+        self._active_track_ids = (None if active_track_ids is None else
+                                  set(active_track_ids))
+        self._advertised_reference_generations = dict(
+            advertised_reference_generations or {})
+
+    def _effective_video_timestamp(self) -> Optional[int]:
+        if self._latest_video_rtp_timestamp is None:
+            return None
+        return ((self._latest_video_rtp_timestamp +
+                 int(round(self._latest_pts_bias_ms * 90.0))) & 0xFFFFFFFF)
+
+    def _content_age_ms(self, reference: VisualReference) -> Optional[int]:
+        effective_video = self._effective_video_timestamp()
+        if effective_video is None:
+            return None
+        age_ticks = RebuildReceiver._signed_pts_delta(
+            effective_video, (reference.pts_ms * 90) & 0xFFFFFFFF)
+        return int(round(age_ticks / 90.0))
+
+    def _reference_gate_reason(self, reference: VisualReference) -> Optional[str]:
+        if (self._latest_generation is not None and
+                reference.generation != self._latest_generation):
+            return "generation"
+        if (self._active_track_ids is not None and
+                reference.track_id not in self._active_track_ids):
+            return "track"
+        known = self._known_references.get(
+            (reference.generation, reference.track_id))
+        if (known is not None and
+                reference.reference_generation != known.reference_generation and
+                not RebuildReceiver._newer_u16(reference.reference_generation,
+                                               known.reference_generation)):
+            return "stale-reference"
+        advertised = self._advertised_reference_generations.get(reference.track_id, 0)
+        if advertised and reference.reference_generation != advertised:
+            return "advertised-reference"
+        age_ms = self._content_age_ms(reference)
+        if age_ms is None:
+            return "clock"
+        if age_ms > self.reference_content_hard_max_age_ms:
+            return "expired"
+        if age_ms < -self.reference_future_max_ms:
+            return "future"
+        return None
+
+    def _record_sr_rejection(self, reason: str, before_submit: bool) -> None:
+        if reason == "expired":
+            if before_submit:
+                self.sr_expired_before_submit += 1
+            else:
+                self.sr_expired_after_compute += 1
+        elif reason == "future":
+            self.sr_future_drops += 1
+        elif reason != "clock":
+            self.sr_invalid_drops += 1
 
     def _submit(self, reference: VisualReference) -> bool:
         """Submit exactly one model-native job.  Caller owns UI-thread access."""
@@ -756,6 +963,7 @@ class RebuildComposer:
             max(2, int(round(reference.image.shape[0] * self.resolver.scale))),
         )
         self.job_key = key
+        self.job_reference = reference
         self.future = self.executor.submit(
             self.resolver.upscale, reference.image.copy(), native_size)
         self.sr_jobs += 1
@@ -767,10 +975,9 @@ class RebuildComposer:
             self.pending_reference = reference
             return
         pending = self.pending_reference
-        if (reference.generation != pending.generation or
-                reference.reference_generation != pending.reference_generation or
-                reference.received_at >= pending.received_at):
+        if reference.received_at >= pending.received_at:
             self.pending_reference = reference
+            self.sr_pending_replaced += 1
 
     def _start_deferred(self) -> None:
         if self.future is not None or self.pending_reference is None:
@@ -779,6 +986,13 @@ class RebuildComposer:
         key = self._reference_key(reference)
         if key in self.cache:
             self.pending_reference = None
+            return
+        reason = self._reference_gate_reason(reference)
+        if reason == "clock":
+            return
+        if reason is not None:
+            self.pending_reference = None
+            self._record_sr_rejection(reason, before_submit=True)
             return
         if self._submit(reference):
             self.pending_reference = None
@@ -791,10 +1005,28 @@ class RebuildComposer:
         keeps the executor latest-only when two targets refresh together.
         """
         self._poll()
+        known = self._known_references.get((reference.generation, reference.track_id))
+        if (known is None or reference.reference_generation == known.reference_generation or
+                RebuildReceiver._newer_u16(reference.reference_generation,
+                                           known.reference_generation)):
+            self._known_references[(reference.generation, reference.track_id)] = reference
         key = self._reference_key(reference)
         if key in self.cache or key == self.job_key:
             return
-        if self.future is not None or not self.resolver.available:
+        if not self.resolver.available:
+            # Keep the newest local-ready candidate while model loading or
+            # fallback initialization is in progress.  Lanczos remains the
+            # immediate display path; the candidate can use SR once ready.
+            self._defer_latest(reference)
+            return
+        reason = self._reference_gate_reason(reference)
+        if reason == "clock":
+            self._defer_latest(reference)
+            return
+        if reason is not None:
+            self._record_sr_rejection(reason, before_submit=True)
+            return
+        if self.future is not None:
             self._defer_latest(reference)
             return
         self._submit(reference)
@@ -810,10 +1042,13 @@ class RebuildComposer:
         future, key = self.future, self.job_key
         self.future = None
         self.job_key = None
+        reference = self.job_reference
+        self.job_reference = None
         try:
             image = future.result()
         except Exception:
             self.sr_stale += 1
+            self._start_deferred()
             return
         # Cache the model-native x2 result by reference identity, not by the
         # current detector-box geometry.  Box jitter changes the paste size on
@@ -821,23 +1056,36 @@ class RebuildComposer:
         # new Real-ESRGAN job continuously and produced soft/sharp pulsing.
         # A stale result cannot overwrite a newer reference generation because
         # the generation is part of the key.
-        self.cache[key] = image
-        self.sr_done += 1
-        if len(self.cache) > 8:
-            oldest = next(iter(self.cache))
-            if oldest != key:
-                self.cache.pop(oldest, None)
+        if reference is None:
+            self.sr_stale += 1
+        else:
+            reason = self._reference_gate_reason(reference)
+            if reason is not None:
+                self.sr_stale += 1
+                self._record_sr_rejection(reason, before_submit=False)
+            else:
+                self.cache[key] = image
+                self.sr_done += 1
+                if len(self.cache) > 8:
+                    oldest = next(iter(self.cache))
+                    if oldest != key:
+                        self.cache.pop(oldest, None)
         # A later reference may have arrived while this one was running.  It
         # gets the next (and only) slot instead of waiting for a renderer tick
         # that could occur after its 1 s content-age deadline.
         self._start_deferred()
 
-    def _assets(self, reference: VisualReference, size: Tuple[int, int]) -> Tuple[np.ndarray,
-                                                                                 np.ndarray,
-                                                                                 bool]:
+    def _assets(self, reference: VisualReference, size: Tuple[int, int],
+               cache_keys: Optional[set] = None) -> Tuple[np.ndarray,
+                                                           np.ndarray,
+                                                           bool]:
         self.prefetch(reference)
         key = self._reference_key(reference)
-        native = self.cache.get(key)
+        # A render observes one immutable SR-cache view.  A worker may finish
+        # while this method is processing another target, but that result is
+        # eligible only for the next source frame.
+        native = (self.cache.get(key) if cache_keys is None or key in cache_keys
+                  else None)
         enhanced = native is not None and self.resolver.available
         if native is not None:
             patch = cv2.resize(native, size, interpolation=cv2.INTER_LANCZOS4)
@@ -1044,15 +1292,33 @@ class RebuildComposer:
     def render(self, base: np.ndarray, state: Optional[rb.StateRecord], generation: int,
                references: Dict[int, VisualReference], now: Optional[float] = None,
                video_rtp_timestamp: Optional[int] = None,
-               pts_bias_ms: int = 0) -> Tuple[np.ndarray, str]:
+               pts_bias_ms: int = 0,
+               source_sequence: Optional[int] = None) -> Tuple[np.ndarray, str]:
         now = time.monotonic() if now is None else now
+        active_track_ids = (set() if state is None else
+                            {target.track_id for target in state.targets})
+        advertised_generations = ({} if state is None else {
+            target.track_id: target.reference_generation for target in state.targets
+        })
+        self.update_timing(
+            video_rtp_timestamp, pts_bias_ms, generation, active_track_ids,
+            advertised_generations)
         self._poll()
         # Direct users of RebuildComposer (tests or an alternate UI) may not
         # use RebuildReceiver.take_completed_references().  Start any supplied
-        # crop before inspecting target flags/PTS so this fallback has the same
-        # early-launch property, while render safety remains unchanged below.
+        # crop before inspecting PTS so this fallback has the same early-launch
+        # property, while render safety remains unchanged below.
         for reference in references.values():
             self.prefetch(reference)
+        render_cache_keys = set(self.cache)
+        if (source_sequence is not None and
+                self._composed_source_sequence == source_sequence and
+                self._composed_generation == generation and
+                self._composed_frame is not None):
+            # PATCH, STATE, and SR callbacks may have changed next-frame state,
+            # but an already composed source frame is immutable until its
+            # sequence advances.
+            return self._composed_frame, self._composed_spatial
         output_width, output_height = self.output_size
         if state is not None and state.output_width > 0 and state.output_height > 0:
             output_width, output_height = state.output_width, state.output_height
@@ -1064,6 +1330,8 @@ class RebuildComposer:
         self.last_refs_used = 0
         self.last_ref_age = None
         self.last_ref_content_age_ms = None
+        self.last_reference_pts_ms = None
+        self.last_reference_generation = None
         self.last_match_score = None
         self.last_rebuild_percent = 0.0
         self.registration_drops = 0
@@ -1085,23 +1353,28 @@ class RebuildComposer:
                 active_smooth_keys.add(
                     (generation, target.track_id, target.reference_generation))
                 reference = references.get(target.track_id)
-                if (reference is None or not (target.flags & 1) or
-                        reference.generation != generation or
-                        now - reference.received_at > self.reference_max_age or
-                        reference.reference_generation != target.reference_generation):
+                if (reference is None or reference.generation != generation or
+                        (target.reference_generation and
+                         reference.reference_generation != target.reference_generation) or
+                        now - reference.received_at > self.reference_cache_ttl_ms / 1000.0):
                     continue
-                content_age_ms = None
-                if effective_video_rtp_timestamp is not None:
-                    content_age_ticks = RebuildReceiver._signed_pts_delta(
-                        effective_video_rtp_timestamp,
-                        (reference.pts_ms * 90) & 0xFFFFFFFF)
-                    content_age_ms = int(round(content_age_ticks / 90.0))
-                    # A reference which is newer than the base by more than
-                    # the semantic gate, or older than the display age budget,
-                    # is unsafe even when its UDP transfer just completed.
-                    if (content_age_ms < -100 or
-                            content_age_ms > int(round(self.reference_max_age * 1000.0))):
-                        continue
+                self.last_ref_age = max(0.0, now - reference.received_at)
+                self.last_reference_pts_ms = reference.pts_ms
+                self.last_reference_generation = reference.reference_generation
+                if effective_video_rtp_timestamp is None:
+                    self.timing_drops += 1
+                    continue
+                content_age_ticks = RebuildReceiver._signed_pts_delta(
+                    effective_video_rtp_timestamp,
+                    (reference.pts_ms * 90) & 0xFFFFFFFF)
+                content_age_ms = int(round(content_age_ticks / 90.0))
+                self.last_ref_content_age_ms = content_age_ms
+                if content_age_ms > self.reference_content_hard_max_age_ms:
+                    self.age_drops += 1
+                    continue
+                if content_age_ms < -self.reference_future_max_ms:
+                    self.future_drops += 1
+                    continue
                 registered = self._registered_crop(reference, target, scale_x, scale_y)
                 if registered is None:
                     self.registration_drops += 1
@@ -1110,7 +1383,7 @@ class RebuildComposer:
                 crop_width = max(2, x1 - x)
                 crop_height = max(2, y1 - y)
                 patch, mask, enhanced = self._assets(
-                    reference, (crop_width, crop_height))
+                    reference, (crop_width, crop_height), render_cache_keys)
                 corrected, score, attempted = self._content_register(
                     canvas, patch, mask, x, y)
                 if attempted:
@@ -1138,13 +1411,6 @@ class RebuildComposer:
                         rebuilt_pixels[y0:y1, x0:x1], (mask_roi > 32).astype(np.uint8))
                 used_sr = used_sr or enhanced
                 self.last_refs_used += 1
-                age = now - reference.received_at
-                self.last_ref_age = age if self.last_ref_age is None else max(
-                    self.last_ref_age, age)
-                if content_age_ms is not None:
-                    self.last_ref_content_age_ms = (
-                        content_age_ms if self.last_ref_content_age_ms is None else
-                        max(self.last_ref_content_age_ms, content_age_ms))
                 if self.draw_targets:
                     left = int(round(target.left * scale_x))
                     top = int(round(target.top * scale_y))
@@ -1167,6 +1433,12 @@ class RebuildComposer:
         if output_width > 0 and output_height > 0:
             self.last_rebuild_percent = float(np.count_nonzero(rebuilt_pixels)) * 100.0 / (
                 output_width * output_height)
+        if source_sequence is not None:
+            self._composed_source_sequence = source_sequence
+            self._composed_generation = generation
+            self._composed_frame = canvas
+            self._composed_spatial = self.last_spatial
+            self.composed_frames += 1
         return canvas, self.last_spatial
 
     def snapshot(self) -> dict:
@@ -1175,18 +1447,34 @@ class RebuildComposer:
             "refs_used": self.last_refs_used,
             "reference_age": self.last_ref_age,
             "reference_content_age_ms": self.last_ref_content_age_ms,
+            "reference_pts_ms": self.last_reference_pts_ms,
+            "reference_generation": self.last_reference_generation,
             "rebuild_percent": self.last_rebuild_percent,
             "chroma_mode": self.last_chroma_mode,
+            "reference_cache_ttl_ms": self.reference_cache_ttl_ms,
+            "reference_content_hard_max_age_ms": self.reference_content_hard_max_age_ms,
+            "reference_future_max_ms": self.reference_future_max_ms,
+            "age_drops": self.age_drops,
+            "future_drops": self.future_drops,
+            "timing_drops": self.timing_drops,
             "sr_model": self.resolver.model_name,
             "sr_pending": self.future is not None,
             "sr_queued": self.pending_reference is not None,
+            "sr_running": self.future is not None,
+            "sr_queue": 1 if self.pending_reference is not None else 0,
             "sr_jobs": self.sr_jobs,
             "sr_done": self.sr_done,
             "sr_stale": self.sr_stale,
+            "sr_x": self.sr_expired_before_submit,
+            "sr_expired_after_compute": self.sr_expired_after_compute,
+            "sr_future_drops": self.sr_future_drops,
+            "sr_pending_replaced": self.sr_pending_replaced,
             "registration_drops": self.registration_drops,
             "content_drops": self.content_drops,
             "content_matches": self.content_matches,
             "match_score": self.last_match_score,
+            "composed_source_sequence": self._composed_source_sequence,
+            "composed_frames": self.composed_frames,
         }
 
     def close(self) -> None:

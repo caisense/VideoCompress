@@ -29,12 +29,15 @@ SnapshotConfig::SnapshotConfig()
 
 RebuildConfig::RebuildConfig()
     : udp_port(5009), output_width(640), output_height(360), output_fps(12),
-      min_confidence(0.35f), max_targets(2), patch_max_side(128),
-      // A reference older than about one second is deliberately rejected by
-      // the receiver.  Refreshing at 700 ms keeps the geometry registration
-      // useful while still sending references progressively on the shared
-      // 100 kbps bucket.
-      patch_jpeg_quality(72), patch_max_bytes(1600), patch_refresh_ms(700),
+      min_confidence(0.35f), max_targets(2), patch_max_side(96),
+      // Refresh is deadline-driven: the soft threshold is used when the
+      // measured transfer fits comfortably, while the hard deadline and
+      // guard pull the next transfer earlier when the shared link is busy.
+      // Keep the normal crop close to one MTU-sized RB/1 data packet.  At the
+      // rebuild profile's 100 kbps shared ceiling, a two-fragment reference
+      // can otherwise consume the H.265 budget and force P-frame recovery.
+      patch_jpeg_quality(50), patch_max_bytes(800), patch_soft_refresh_ms(220),
+      patch_hard_deadline_ms(450), patch_refresh_guard_ms(75),
       patch_chunk_bytes(1100), patch_packets_per_frame(2),
       crop_margin_percent(20), parity(true) {}
 
@@ -329,7 +332,16 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "rebuild-patch-max-side" && parseInt(value, &integer)) config->transport.rebuild.patch_max_side = integer;
         else if (key == "rebuild-jpeg-quality" && parseInt(value, &integer)) config->transport.rebuild.patch_jpeg_quality = integer;
         else if (key == "rebuild-patch-max-bytes" && parseInt(value, &integer)) config->transport.rebuild.patch_max_bytes = integer;
-        else if (key == "rebuild-patch-refresh-ms" && parseInt(value, &integer)) config->transport.rebuild.patch_refresh_ms = integer;
+        else if ((key == "rebuild-reference-soft-refresh-ms" ||
+                  key == "rebuild-patch-refresh-ms") && parseInt(value, &integer)) {
+            config->transport.rebuild.patch_soft_refresh_ms = integer;
+        }
+        else if (key == "rebuild-reference-hard-deadline-ms" && parseInt(value, &integer)) {
+            config->transport.rebuild.patch_hard_deadline_ms = integer;
+        }
+        else if (key == "rebuild-reference-refresh-guard-ms" && parseInt(value, &integer)) {
+            config->transport.rebuild.patch_refresh_guard_ms = integer;
+        }
         else if (key == "rebuild-chunk-bytes" && parseInt(value, &integer)) config->transport.rebuild.patch_chunk_bytes = integer;
         else if (key == "rebuild-patch-packets-per-frame" && parseInt(value, &integer)) config->transport.rebuild.patch_packets_per_frame = integer;
         else if (key == "rebuild-crop-margin-percent" && parseInt(value, &integer)) config->transport.rebuild.crop_margin_percent = integer;
@@ -420,8 +432,16 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         config->transport.rebuild.patch_jpeg_quality > 95 ||
         config->transport.rebuild.patch_max_bytes < 256 ||
         config->transport.rebuild.patch_max_bytes > 8192 ||
-        config->transport.rebuild.patch_refresh_ms < 100 ||
-        config->transport.rebuild.patch_refresh_ms > 10000 ||
+        config->transport.rebuild.patch_soft_refresh_ms < 0 ||
+        config->transport.rebuild.patch_soft_refresh_ms > 10000 ||
+        config->transport.rebuild.patch_hard_deadline_ms < 100 ||
+        config->transport.rebuild.patch_hard_deadline_ms > 10000 ||
+        config->transport.rebuild.patch_refresh_guard_ms < 0 ||
+        config->transport.rebuild.patch_refresh_guard_ms > 1000 ||
+        config->transport.rebuild.patch_soft_refresh_ms >=
+            config->transport.rebuild.patch_hard_deadline_ms ||
+        config->transport.rebuild.patch_refresh_guard_ms >=
+            config->transport.rebuild.patch_hard_deadline_ms ||
         config->transport.rebuild.patch_chunk_bytes < 128 ||
         config->transport.rebuild.patch_chunk_bytes > config->transport.mtu - 100 ||
         config->transport.rebuild.patch_packets_per_frame < 1 ||

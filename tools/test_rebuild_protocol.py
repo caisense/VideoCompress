@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -140,6 +141,21 @@ class RebuildProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rb.parse_state(rb.build_state(oversized))
 
+    def test_patch_zero_reference_generation_is_not_local_ready(self):
+        blob = b"\x10\x01" + bytes(range(8))
+        fragment = make_fragment(blob, 0, 1, len(blob), blob)
+        invalid = rb.PatchFragment(
+            fragment.transfer_id, fragment.track_id, 0,
+            fragment.left, fragment.top, fragment.right, fragment.bottom,
+            fragment.reference_left, fragment.reference_top,
+            fragment.reference_right, fragment.reference_bottom,
+            fragment.jpeg_width, fragment.jpeg_height, fragment.mask_width,
+            fragment.mask_height, fragment.fragment_index, fragment.data_fragments,
+            fragment.blob_size, fragment.mask_rle_bytes, fragment.chunk_bytes,
+            fragment.data)
+        with self.assertRaisesRegex(ValueError, "invalid RB/1 patch"):
+            rb.parse_fragment(rb.build_fragment(invalid))
+
     def test_xor_parity_recovers_one_missing_fragment(self):
         blob = b"\x10\x01" + bytes(range(61))
         chunk = 20
@@ -229,6 +245,12 @@ class RebuildProtocolTests(unittest.TestCase):
         receiver.on_datagram(rb.build_packet(rb.Packet(
             rb.STATE, rb.PROFILE_REBUILD, 5, 0, 10, 1, 1000,
             rb.build_state(pending))), now=1.0)
+        # PATCH fragments and a later source frame may interleave before the
+        # completion STATE for this source PTS arrives.
+        bridge = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, ())
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, rb.PROFILE_REBUILD, 5, 0, 11, 2, 1017,
+            rb.build_state(bridge))), now=1.05)
         # The sender's completion STATE deliberately shares the source PTS
         # with the first STATE, but has a higher RB/1 sequence and flags=1.
         receiver.on_datagram(rb.build_packet(rb.Packet(
@@ -239,7 +261,7 @@ class RebuildProtocolTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertEqual(selected.targets[0].reference_generation, 2)
         self.assertEqual(selected.targets[0].flags, 1)
-        self.assertEqual(len(receiver.state_history), 1)
+        self.assertEqual(len(receiver.state_history), 2)
 
         # A reordered copy of the earlier STATE must not clear readiness.
         receiver.on_datagram(rb.build_packet(rb.Packet(
@@ -248,6 +270,142 @@ class RebuildProtocolTests(unittest.TestCase):
         selected, _, _, _, _ = receiver.scene_synced(1000 * 90)
         self.assertEqual(selected.targets[0].reference_generation, 2)
         self.assertEqual(selected.targets[0].flags, 1)
+
+    def test_complete_patch_is_local_ready_without_ready_state(self):
+        pending = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 220, 280, 0, 0),))
+        receiver = RebuildReceiver()
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, 3, 5, 0, 1, 10, 1000, rb.build_state(pending))), now=10.0)
+
+        image = np.full((80, 48, 3), (20, 30, 230), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+        blob = b"\x10\x01" + encoded.tobytes()
+        chunk = 90
+        count = (len(blob) + chunk - 1) // chunk
+        for index in range(count):
+            piece = blob[index * chunk:(index + 1) * chunk]
+            fragment = make_fragment(blob, index, count, chunk, piece)
+            receiver.on_datagram(rb.build_packet(rb.Packet(
+                rb.PATCH_DATA, 3, 5, 0, 2 + index, 10, 1000,
+                rb.build_fragment(fragment))), now=10.1 + index * 0.01)
+
+        scene, generation, references, _ = receiver.scene()
+        self.assertEqual(generation, 5)
+        self.assertEqual(scene.targets[0].flags, 0)
+        self.assertEqual(len(references), 1)
+        self.assertEqual(receiver.take_completed_references()[0].reference_generation, 2)
+
+        composer = RebuildComposer(resolver=SuperResolver(enabled=False))
+        try:
+            base = np.full((144, 256, 3), 80, dtype=np.uint8)
+            _, spatial = composer.render(
+                base, scene, generation, references, now=10.2,
+                video_rtp_timestamp=1000 * 90)
+            self.assertEqual(spatial, "ROI-LANCZOS")
+        finally:
+            composer.close()
+
+    def test_late_older_reference_state_cannot_roll_back_local_generation(self):
+        current = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 1),))
+        older = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 220, 280, 1, 1),))
+        receiver = RebuildReceiver()
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, 3, 5, 0, 10, 10, 1000, rb.build_state(current))), now=1.0)
+        # A local-ready reference establishes generation 2 even before the
+        # sender's completion STATE is observed.
+        reference = self._visual_reference(reference_generation=2, received_at=1.1)
+        receiver.references[4] = reference
+        receiver.reference_generations[4] = 2
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, 3, 5, 0, 11, 10, 1000, rb.build_state(older))), now=1.2)
+        selected, _, _, _, _ = receiver.scene_synced(1000 * 90)
+        self.assertEqual(selected.targets[0].reference_generation, 2)
+        self.assertEqual(receiver.snapshot()["reference_generation_drops"], 1)
+
+    def test_reference_content_hard_age_is_inclusive_at_450_ms(self):
+        reference = self._visual_reference(received_at=10.0)
+        target = rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 0)
+        state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+        base = np.full((144, 256, 3), 80, dtype=np.uint8)
+        for age_ms, expected in ((449, "ROI-LANCZOS"),
+                                 (450, "ROI-LANCZOS"),
+                                 (451, "BASE-LANCZOS")):
+            composer = RebuildComposer(resolver=SuperResolver(enabled=False))
+            try:
+                _, spatial = composer.render(
+                    base, state, 5, {4: reference}, now=10.1,
+                    video_rtp_timestamp=(1000 + age_ms) * 90)
+                self.assertEqual(spatial, expected)
+                self.assertEqual(composer.snapshot()["reference_content_age_ms"], age_ms)
+                if age_ms == 451:
+                    self.assertEqual(composer.snapshot()["age_drops"], 1)
+            finally:
+                composer.close()
+
+    def test_reference_future_gate_is_inclusive_at_minus_100_ms(self):
+        reference = self._visual_reference(received_at=10.0)
+        target = rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 0)
+        state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+        base = np.full((144, 256, 3), 80, dtype=np.uint8)
+        for age_ms, expected in ((-100, "ROI-LANCZOS"),
+                                 (-101, "BASE-LANCZOS")):
+            composer = RebuildComposer(resolver=SuperResolver(enabled=False))
+            try:
+                _, spatial = composer.render(
+                    base, state, 5, {4: reference}, now=10.1,
+                    video_rtp_timestamp=(1000 + age_ms) * 90)
+                self.assertEqual(spatial, expected)
+                self.assertEqual(composer.snapshot()["reference_content_age_ms"], age_ms)
+                self.assertEqual(composer.snapshot()["future_drops"],
+                                 1 if age_ms == -101 else 0)
+            finally:
+                composer.close()
+
+    def test_reference_cache_ttl_is_separate_from_content_age(self):
+        reference = self._visual_reference(received_at=10.0)
+        target = rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 0)
+        state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+        base = np.full((144, 256, 3), 80, dtype=np.uint8)
+        composer = RebuildComposer(resolver=SuperResolver(enabled=False))
+        try:
+            _, spatial = composer.render(
+                base, state, 5, {4: reference}, now=10.5,
+                video_rtp_timestamp=1000 * 90)
+            self.assertEqual(spatial, "ROI-LANCZOS")
+            self.assertEqual(composer.snapshot()["age_drops"], 0)
+
+            _, spatial = composer.render(
+                base, state, 5, {4: reference}, now=11.1,
+                video_rtp_timestamp=1000 * 90)
+            self.assertEqual(spatial, "BASE-LANCZOS")
+            self.assertEqual(composer.snapshot()["age_drops"], 0)
+            self.assertEqual(composer.snapshot()["reference_cache_ttl_ms"], 1000)
+        finally:
+            composer.close()
+
+    def test_udp_jitter_and_reorder_never_rolls_generation_back(self):
+        empty = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, ())
+        receiver = RebuildReceiver()
+        current = rb.build_packet(rb.Packet(
+            rb.STATE, rb.PROFILE_REBUILD, 30, 0, 100, 30, 2000,
+            rb.build_state(empty)))
+        receiver.on_datagram(current, now=1.000)
+        for index, delay_ms in enumerate((0, 20, 50, 100)):
+            receiver.on_datagram(rb.build_packet(rb.Packet(
+                rb.STATE, rb.PROFILE_REBUILD, 29, 0, 99 - index, 29 - index,
+                1999 - delay_ms, rb.build_state(empty))),
+                now=1.000 + delay_ms / 1000.0)
+        state, generation, _, _ = receiver.scene()
+        self.assertEqual(generation, 30)
+        self.assertEqual(state, empty)
+        self.assertEqual(receiver.snapshot()["reordered"], 4)
 
     def test_receiver_calibrates_a_stable_decoder_pts_offset(self):
         receiver = RebuildReceiver(max_sync_ms=100)
@@ -348,7 +506,9 @@ class RebuildProtocolTests(unittest.TestCase):
             draw_targets=False)
         base = np.empty((144, 256, 3), dtype=np.uint8)
         base[:, :] = (60, 80, 100)
-        output, spatial = composer.render(base, scene, generation, references, now=2.5)
+        output, spatial = composer.render(
+            base, scene, generation, references, now=2.5,
+            video_rtp_timestamp=1000 * 90)
         self.assertEqual(output.shape, (360, 640, 3))
         self.assertEqual(spatial, "ROI-LANCZOS")
         self.assertGreater(int(output[:, :, 2].max()), 100)
@@ -356,7 +516,9 @@ class RebuildProtocolTests(unittest.TestCase):
         self.assertEqual(composer.snapshot()["chroma_mode"], "COLOR")
 
         gray = np.full((144, 256, 3), 80, dtype=np.uint8)
-        mono, spatial = composer.render(gray, scene, generation, references, now=2.6)
+        mono, spatial = composer.render(
+            gray, scene, generation, references, now=2.6,
+            video_rtp_timestamp=1000 * 90)
         self.assertEqual(spatial, "ROI-LANCZOS")
         self.assertEqual(composer.snapshot()["chroma_mode"], "MONO")
         self.assertLessEqual(int(np.max(mono.max(axis=2) - mono.min(axis=2))), 1)
@@ -364,7 +526,9 @@ class RebuildProtocolTests(unittest.TestCase):
         undeclared = rb.StateRecord(
             640, 480, 640, 360, 6, 12, 1,
             (rb.TargetState(4, 0, 91, 100, 80, 220, 280, 1, 0),))
-        base_only, spatial = composer.render(gray, undeclared, generation, references, now=2.7)
+        base_only, spatial = composer.render(
+            gray, undeclared, generation, references, now=2.7,
+            video_rtp_timestamp=1000 * 90)
         self.assertEqual(spatial, "BASE-LANCZOS")
         self.assertTrue(np.array_equal(base_only, cv2.resize(
             gray, (640, 360), interpolation=cv2.INTER_LANCZOS4)))
@@ -382,11 +546,12 @@ class RebuildProtocolTests(unittest.TestCase):
 
         reference = self._visual_reference()
         composer = RebuildComposer(
-            output_size=(640, 360), resolver=FakeResolver(), reference_max_age=1.0)
+            output_size=(640, 360), resolver=FakeResolver())
         try:
-            # This is the crucial ordering: arrival triggers SR before the
-            # reference is advertised by a PTS-matched STATE.  At 999 ms of
-            # content age there is no time left to begin a GPU job.
+            # Arrival triggers SR before the reference is advertised by a
+            # PTS-matched STATE.  The candidate is still inside the 450 ms
+            # content deadline when it is submitted and completed.
+            composer.update_timing(1000 * 90, generation=5, active_track_ids={4})
             composer.prefetch(reference)
             deadline = time.monotonic() + 1.0
             while composer.snapshot()["sr_done"] != 1 and time.monotonic() < deadline:
@@ -400,9 +565,41 @@ class RebuildProtocolTests(unittest.TestCase):
             base = np.zeros((144, 256, 3), dtype=np.uint8)
             _, spatial = composer.render(
                 base, state, 5, {4: reference}, now=10.999,
-                video_rtp_timestamp=1999 * 90)
+                video_rtp_timestamp=1449 * 90)
             self.assertEqual(spatial, "ROI-ESRGAN")
-            self.assertEqual(composer.snapshot()["reference_content_age_ms"], 999)
+            self.assertEqual(composer.snapshot()["reference_content_age_ms"], 449)
+        finally:
+            composer.close()
+
+    def test_prefetch_retains_latest_reference_during_sr_warmup(self):
+        class ToggleResolver:
+            scale = 2
+            available = False
+            model_name = "Fake-SR"
+
+            @staticmethod
+            def upscale(image, target_size):
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        resolver = ToggleResolver()
+        older = self._visual_reference(reference_generation=2, received_at=10.0)
+        newest = self._visual_reference(reference_generation=3, received_at=10.1)
+        composer = RebuildComposer(resolver=resolver)
+        try:
+            composer.update_timing(1000 * 90, generation=5, active_track_ids={4})
+            composer.prefetch(older)
+            composer.prefetch(newest)
+            self.assertEqual(composer.snapshot()["sr_queue"], 1)
+            resolver.available = True
+            deadline = time.monotonic() + 1.0
+            while composer.snapshot()["sr_done"] < 1 and time.monotonic() < deadline:
+                composer.prefetch_pending()
+                time.sleep(0.005)
+            values = composer.snapshot()
+            self.assertEqual(values["sr_jobs"], 1)
+            self.assertEqual(values["sr_done"], 1)
+            self.assertIn((5, 4, 3), composer.cache)
+            self.assertNotIn((5, 4, 2), composer.cache)
         finally:
             composer.close()
 
@@ -421,19 +618,145 @@ class RebuildProtocolTests(unittest.TestCase):
         newest = self._visual_reference(reference_generation=3, received_at=10.1)
         composer = RebuildComposer(resolver=SlowResolver())
         try:
+            composer.update_timing(1000 * 90, generation=5, active_track_ids={4})
             composer.prefetch(first)
             composer.prefetch(newest)
             self.assertEqual(composer.snapshot()["sr_jobs"], 1)
             self.assertTrue(composer.snapshot()["sr_queued"])
             deadline = time.monotonic() + 1.0
-            while composer.snapshot()["sr_done"] != 2 and time.monotonic() < deadline:
+            while (composer.snapshot()["sr_done"] + composer.snapshot()["sr_stale"] < 2 and
+                   time.monotonic() < deadline):
                 composer.prefetch_pending()
                 time.sleep(0.005)
             values = composer.snapshot()
-            self.assertEqual(values["sr_done"], 2)
+            # The first result becomes stale as soon as the newer local
+            # reference arrives; only the latest reference may enter cache.
+            self.assertEqual(values["sr_done"], 1)
             self.assertEqual(values["sr_jobs"], 2)
+            self.assertEqual(values["sr_stale"], 1)
             self.assertFalse(values["sr_queued"])
             self.assertIn((5, 4, 3), composer.cache)
+        finally:
+            composer.close()
+
+    def test_sr_expired_pending_candidate_is_rejected_before_submit(self):
+        class ControlledResolver:
+            scale = 2
+            available = True
+            model_name = "Fake-SR"
+
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.calls = 0
+
+            def upscale(self, image, target_size):
+                self.calls += 1
+                self.started.set()
+                self.release.wait(1.0)
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        resolver = ControlledResolver()
+        first = self._visual_reference(reference_generation=2, received_at=10.0)
+        newest = self._visual_reference(reference_generation=3, received_at=10.1)
+        composer = RebuildComposer(resolver=resolver)
+        try:
+            composer.update_timing(1000 * 90, generation=5, active_track_ids={4})
+            composer.prefetch(first)
+            self.assertTrue(resolver.started.wait(1.0))
+            composer.prefetch(newest)
+            composer.update_timing(1500 * 90, generation=5, active_track_ids={4})
+            resolver.release.set()
+            deadline = time.monotonic() + 1.0
+            while (composer.snapshot()["sr_stale"] < 1 and
+                   time.monotonic() < deadline):
+                composer.prefetch_pending()
+                time.sleep(0.005)
+            values = composer.snapshot()
+            self.assertEqual(resolver.calls, 1)
+            self.assertEqual(values["sr_jobs"], 1)
+            self.assertEqual(values["sr_done"], 0)
+            self.assertEqual(values["sr_x"], 1)
+            self.assertEqual(values["sr_queue"], 0)
+        finally:
+            resolver.release.set()
+            composer.close()
+
+    def test_sr_result_is_stale_when_reference_generation_changes_during_compute(self):
+        class ControlledResolver:
+            scale = 2
+            available = True
+            model_name = "Fake-SR"
+
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def upscale(self, image, target_size):
+                self.started.set()
+                self.release.wait(1.0)
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        resolver = ControlledResolver()
+        old = self._visual_reference(reference_generation=20, received_at=10.0)
+        new = self._visual_reference(reference_generation=21, received_at=10.1)
+        composer = RebuildComposer(resolver=resolver)
+        try:
+            composer.update_timing(1000 * 90, generation=5, active_track_ids={4})
+            composer.prefetch(old)
+            self.assertTrue(resolver.started.wait(1.0))
+            composer.prefetch(new)
+            resolver.release.set()
+            deadline = time.monotonic() + 1.0
+            while (composer.snapshot()["sr_done"] < 1 and
+                   time.monotonic() < deadline):
+                composer.prefetch_pending()
+                time.sleep(0.005)
+            values = composer.snapshot()
+            self.assertEqual(values["sr_jobs"], 2)
+            self.assertEqual(values["sr_done"], 1)
+            self.assertEqual(values["sr_stale"], 1)
+            self.assertIn((5, 4, 21), composer.cache)
+            self.assertNotIn((5, 4, 20), composer.cache)
+        finally:
+            resolver.release.set()
+            composer.close()
+
+    def test_same_source_frame_reuses_immutable_composed_pixels(self):
+        class ManualResolver:
+            scale = 2
+            available = False
+            model_name = "Fake-SR"
+
+            @staticmethod
+            def upscale(image, target_size):
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        resolver = ManualResolver()
+        reference = self._visual_reference()
+        target = rb.TargetState(4, 0, 91, 100, 80, 220, 280, 2, 0)
+        state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+        base = np.full((144, 256, 3), 80, dtype=np.uint8)
+        composer = RebuildComposer(resolver=resolver)
+        try:
+            first, first_mode = composer.render(
+                base, state, 5, {4: reference}, now=10.0,
+                video_rtp_timestamp=1000 * 90, source_sequence=100)
+            resolver.available = True
+            composer.cache[(5, 4, 2)] = np.full((160, 96, 3), 240, dtype=np.uint8)
+            second, second_mode = composer.render(
+                base, state, 5, {4: reference}, now=10.1,
+                video_rtp_timestamp=1000 * 90, source_sequence=100)
+            self.assertEqual(first_mode, "ROI-LANCZOS")
+            self.assertEqual(second_mode, "ROI-LANCZOS")
+            self.assertTrue(np.array_equal(first, second))
+
+            third, third_mode = composer.render(
+                base, state, 5, {4: reference}, now=10.2,
+                video_rtp_timestamp=1000 * 90, source_sequence=101)
+            self.assertEqual(third_mode, "ROI-ESRGAN")
+            self.assertFalse(np.array_equal(first, third))
+            self.assertEqual(composer.snapshot()["composed_frames"], 2)
         finally:
             composer.close()
 

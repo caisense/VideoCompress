@@ -111,12 +111,44 @@ void testPatchFragmentRoundTrip() {
     CHECK(parsed.mask_rle_bytes == 180 && parsed.data == fragment.data);
 }
 
+void testZeroReferenceGenerationRejected() {
+    roi_h265::RebuildPatchFragment fragment;
+    fragment.transfer_id = 77;
+    fragment.track_id = 9;
+    fragment.reference_generation = 0;
+    fragment.left = 80;
+    fragment.top = 40;
+    fragment.right = 240;
+    fragment.bottom = 320;
+    fragment.reference_left = 90;
+    fragment.reference_top = 50;
+    fragment.reference_right = 230;
+    fragment.reference_bottom = 310;
+    fragment.jpeg_width = 73;
+    fragment.jpeg_height = 128;
+    fragment.mask_width = 32;
+    fragment.mask_height = 32;
+    fragment.fragment_index = 0;
+    fragment.data_fragments = 1;
+    fragment.blob_size = 800;
+    fragment.mask_rle_bytes = 180;
+    fragment.chunk_bytes = 900;
+    fragment.data.assign(800, 0x5a);
+    std::vector<uint8_t> payload;
+    std::string error;
+    CHECK(roi_h265::serializeRebuildPatchFragment(fragment, &payload, &error));
+    roi_h265::RebuildPatchFragment parsed;
+    CHECK(!roi_h265::parseRebuildPatchFragment(
+        payload.data(), payload.size(), &parsed, &error));
+}
+
 }  // namespace
 
 int main() {
     testPacketRoundTripAndCrc();
     testStateRoundTrip();
     testPatchFragmentRoundTrip();
+    testZeroReferenceGenerationRejected();
     std::cout << "rebuild protocol tests passed" << std::endl;
     return 0;
 }

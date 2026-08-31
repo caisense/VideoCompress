@@ -1,6 +1,7 @@
 #include "transport/rebuild_sender.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +37,23 @@ uint16_t clampU16(int value) {
     return static_cast<uint16_t>(std::max(0, std::min(65535, value)));
 }
 
+// FrameMeta::capture_time_us is produced from steady_clock.  Keep sender
+// scheduling and latency samples on the same clock domain; system_clock would
+// make every completed reference look billions of microseconds old.
+uint64_t steadyNowMicros() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+uint64_t percentile(const std::vector<uint64_t> &values, double fraction) {
+    if (values.empty()) return 0;
+    std::vector<uint64_t> sorted(values);
+    std::sort(sorted.begin(), sorted.end());
+    const size_t index = std::min(sorted.size() - 1,
+        static_cast<size_t>(std::ceil(fraction * sorted.size()) - 1.0));
+    return sorted[index];
+}
+
 std::vector<uint8_t> runLengthEncodeMask(const cv::Mat &mask) {
     std::vector<uint8_t> output;
     if (mask.empty()) return output;
@@ -67,11 +85,19 @@ RebuildSenderSnapshot::RebuildSenderSnapshot()
     : enabled(false), transmitting(false), queued_requests(0), submitted_requests(0),
       replaced_requests(0), state_packets(0), patch_transfers(0), patch_packets(0),
       parity_packets(0), patch_jpeg_bytes(0), sent_wire_bytes(0),
-      cancelled_requests(0) {}
+      cancelled_requests(0), last_reference_generation(0),
+      last_reference_capture_time_us(0), last_reference_encode_finish_time_us(0),
+      last_reference_queue_enter_time_us(0),
+      last_reference_first_packet_send_time_us(0),
+      last_reference_last_packet_send_time_us(0),
+      last_reference_queue_delay_us(0), last_reference_capture_to_send_us(0),
+      reference_capture_to_send_p50_us(0),
+      reference_capture_to_send_p95_us(0), last_reference_blob_bytes(0),
+      last_reference_chunk_count(0), last_reference_fec_bytes(0) {}
 
 RebuildSender::Track::Track()
     : id(0), class_id(-1), confidence(0.0f), last_seen_frame(0),
-      reference_generation(0), has_reference(false) {}
+      reference_generation(0), has_reference(false), last_reference_capture_time_us(0) {}
 
 RebuildSender::RebuildSender(const RebuildConfig &config, const std::string &host, int mtu,
                              const std::shared_ptr<RatePacer> &pacer)
@@ -79,7 +105,7 @@ RebuildSender::RebuildSender(const RebuildConfig &config, const std::string &hos
       destination_(NULL), started_(false), stopping_(false), enabled_(false),
       transmitting_(false), failed_(false), active_generation_(0),
       has_generation_(false), next_track_id_(1), next_transfer_id_(1),
-      next_packet_sequence_(1), has_last_transfer_(false) {}
+      next_packet_sequence_(1) {}
 
 RebuildSender::~RebuildSender() { stop(); }
 
@@ -137,7 +163,6 @@ void RebuildSender::setEnabled(bool enabled) {
         pending_reference_.clear();
         tracks_.clear();
         has_generation_ = false;
-        has_last_transfer_ = false;
         next_track_id_ = 1;
     }
     condition_.notify_all();
@@ -233,7 +258,6 @@ std::vector<RebuildSender::ActiveTarget> RebuildSender::updateTracks(
         next_track_id_ = 1;
         active_generation_ = request.generation;
         has_generation_ = true;
-        has_last_transfer_ = false;
     }
     std::vector<size_t> candidates;
     for (size_t index = 0; index < request.segmentation.instances.size(); ++index) {
@@ -475,6 +499,52 @@ bool RebuildSender::buildReference(const Request &request, const ActiveTarget &a
     return true;
 }
 
+int RebuildSender::estimatedReferenceDeliveryMs() const {
+    // Before the first completed transfer, use a conservative mask allowance
+    // in addition to the configured JPEG cap.  Afterwards the last complete
+    // blob size gives a much tighter estimate without pretending to exceed
+    // the shared RatePacer budget.
+    uint64_t last_blob_bytes = 0;
+    uint64_t observed_p95_us = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_blob_bytes = snapshot_.last_reference_blob_bytes;
+        observed_p95_us = snapshot_.reference_capture_to_send_p95_us;
+    }
+    const size_t estimated_blob = std::min<size_t>(
+        12U * 1024U, last_blob_bytes > 0
+            ? static_cast<size_t>(last_blob_bytes)
+            : static_cast<size_t>(config_.patch_max_bytes) + 1024U);
+    const size_t chunk = static_cast<size_t>(std::max(1, config_.patch_chunk_bytes));
+    const size_t data_fragments = (estimated_blob + chunk - 1U) / chunk;
+    const size_t packet_count = data_fragments +
+        (config_.parity && data_fragments > 1U ? 1U : 0U);
+    const size_t udp_payload = kRebuildHeaderBytes + kRebuildPatchFragmentHeaderBytes + chunk;
+    const size_t wire_bytes = packet_count * RatePacer::wireBytesForUdpPayload(udp_payload);
+    const int bitrate = std::max(1, pacer_->bitrateBps());
+    const int theoretical_ms = static_cast<int>(
+        (wire_bytes * 8000U + static_cast<size_t>(bitrate) - 1U) /
+        static_cast<size_t>(bitrate));
+    const int observed_ms = observed_p95_us > 0
+        ? static_cast<int>((observed_p95_us + 999U) / 1000U) : 0;
+    return std::max(theoretical_ms, observed_ms);
+}
+
+int RebuildSender::referenceRefreshThresholdMs() const {
+    const int delivery_ms = estimatedReferenceDeliveryMs();
+    const int deadline_start = std::max(0, config_.patch_hard_deadline_ms -
+        config_.patch_refresh_guard_ms - delivery_ms);
+    if (deadline_start == 0) {
+        // An estimate beyond the hard window cannot be made timely by
+        // retrying every source frame.  Keep the soft cadence instead of
+        // flooding the shared pacer and starving H.265.
+        return config_.patch_soft_refresh_ms;
+    }
+    // A measured/estimated transfer that is close to the hard deadline pulls
+    // the refresh forward.  A short transfer still obeys the soft cadence.
+    return std::min(config_.patch_soft_refresh_ms, deadline_start);
+}
+
 bool RebuildSender::beginReference(const Request &request, const ActiveTarget &active,
                                    std::string *error) {
     if (pending_reference_.active) {
@@ -506,6 +576,12 @@ bool RebuildSender::beginReference(const Request &request, const ActiveTarget &a
     pending_reference_.parity.swap(parity);
     pending_reference_.next_data_index = 0;
     pending_reference_.jpeg_bytes = jpeg_bytes;
+    pending_reference_.capture_time_us = request.frame->meta.capture_time_us;
+    pending_reference_.encode_finish_time_us = steadyNowMicros();
+    pending_reference_.queue_enter_time_us = pending_reference_.encode_finish_time_us;
+    pending_reference_.chunk_count = fragment_count;
+    pending_reference_.fec_bytes = config_.parity && fragment_count > 1U
+        ? pending_reference_.parity.size() : 0U;
     // Put parity before data.  The receiver can then recover one missing data
     // packet, while an intact transfer completes on its final data packet and
     // cannot be followed by a phantom parity-only incomplete transfer.
@@ -541,6 +617,11 @@ bool RebuildSender::sendPendingReferencePacket(std::string *error) {
         !sendPacket(type, pending_reference_.request, payload, flags, error)) {
         return false;
     }
+    const uint64_t packet_sent_us = steadyNowMicros();
+    if (pending_reference_.first_packet_send_time_us == 0) {
+        pending_reference_.first_packet_send_time_us = packet_sent_us;
+    }
+    pending_reference_.last_packet_send_time_us = packet_sent_us;
     if (type == REBUILD_PATCH_PARITY) pending_reference_.parity_sent = true;
     else ++pending_reference_.next_data_index;
 
@@ -555,16 +636,48 @@ bool RebuildSender::sendPendingReferencePacket(std::string *error) {
         tracks_[index].reference_generation =
             pending_reference_.metadata.reference_generation;
         tracks_[index].has_reference = true;
-        tracks_[index].last_reference = std::chrono::steady_clock::now();
+        tracks_[index].last_reference_capture_time_us =
+            pending_reference_.capture_time_us;
         break;
     }
+    const uint64_t capture_to_send_us =
+        pending_reference_.capture_time_us > 0 &&
+        pending_reference_.last_packet_send_time_us >= pending_reference_.capture_time_us
+            ? pending_reference_.last_packet_send_time_us - pending_reference_.capture_time_us : 0;
+    const uint64_t queue_delay_us =
+        pending_reference_.first_packet_send_time_us >= pending_reference_.queue_enter_time_us
+            ? pending_reference_.first_packet_send_time_us - pending_reference_.queue_enter_time_us : 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++snapshot_.patch_transfers;
         snapshot_.patch_jpeg_bytes += pending_reference_.jpeg_bytes;
+        snapshot_.last_reference_generation =
+            pending_reference_.metadata.reference_generation;
+        snapshot_.last_reference_capture_time_us = pending_reference_.capture_time_us;
+        snapshot_.last_reference_encode_finish_time_us =
+            pending_reference_.encode_finish_time_us;
+        snapshot_.last_reference_queue_enter_time_us = pending_reference_.queue_enter_time_us;
+        snapshot_.last_reference_first_packet_send_time_us =
+            pending_reference_.first_packet_send_time_us;
+        snapshot_.last_reference_last_packet_send_time_us =
+            pending_reference_.last_packet_send_time_us;
+        snapshot_.last_reference_queue_delay_us = queue_delay_us;
+        snapshot_.last_reference_capture_to_send_us = capture_to_send_us;
+        snapshot_.last_reference_blob_bytes = pending_reference_.blob.size();
+        snapshot_.last_reference_chunk_count = pending_reference_.chunk_count;
+        snapshot_.last_reference_fec_bytes = pending_reference_.fec_bytes;
+        if (capture_to_send_us > 0) {
+            reference_capture_to_send_samples_us_.push_back(capture_to_send_us);
+            if (reference_capture_to_send_samples_us_.size() > 64U) {
+                reference_capture_to_send_samples_us_.erase(
+                    reference_capture_to_send_samples_us_.begin());
+            }
+            snapshot_.reference_capture_to_send_p50_us = percentile(
+                reference_capture_to_send_samples_us_, 0.50);
+            snapshot_.reference_capture_to_send_p95_us = percentile(
+                reference_capture_to_send_samples_us_, 0.95);
+        }
     }
-    last_transfer_ = std::chrono::steady_clock::now();
-    has_last_transfer_ = true;
     pending_reference_.clear();
     return true;
 }
@@ -608,30 +721,28 @@ bool RebuildSender::process(const Request &request, std::string *error) {
         ++snapshot_.cancelled_requests;
     }
     if (active.empty()) return true;
-    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-    // References are intentionally sparse.  Spread the per-target refresh
-    // period across the active targets instead of sending several JPEG bursts
-    // back-to-back; this leaves regular service opportunities for the H.265
-    // base layer and semantic state on the same 100 kbps child bucket.
-    const int global_spacing_ms = std::max(250,
-        config_.patch_refresh_ms / std::max<int>(1, active.size()));
-    if (has_last_transfer_ &&
-        now - last_transfer_ < std::chrono::milliseconds(global_spacing_ms)) {
-        return true;
-    }
+    // References are intentionally paced on the same physical token bucket
+    // as H.265.  Start the next transfer at the earlier of the configured soft
+    // cadence and the estimated hard-deadline start, so a large reference
+    // cannot spend its whole valid content lifetime waiting in the queue.
+    const uint64_t now_us = steadyNowMicros();
+    const int refresh_threshold_ms = referenceRefreshThresholdMs();
     size_t selected = active.size();
-    std::chrono::steady_clock::duration oldest_age = std::chrono::steady_clock::duration::zero();
+    uint64_t oldest_age_ms = 0;
     for (size_t index = 0; index < active.size(); ++index) {
         const Track &track = tracks_[active[index].track_index];
         if (!track.has_reference) {
             selected = index;
             break;
         }
-        const std::chrono::steady_clock::duration age = now - track.last_reference;
-        if (age >= std::chrono::milliseconds(config_.patch_refresh_ms) &&
-            (selected == active.size() || age > oldest_age)) {
+        const uint64_t age_ms = track.last_reference_capture_time_us > 0 &&
+            now_us >= track.last_reference_capture_time_us
+            ? (now_us - track.last_reference_capture_time_us) / 1000U : 0U;
+        if (age_ms >= static_cast<uint64_t>(refresh_threshold_ms) &&
+            (selected == active.size() ||
+             age_ms > oldest_age_ms)) {
             selected = index;
-            oldest_age = age;
+            oldest_age_ms = age_ms;
         }
     }
     // Start at most one reference transfer here, then emit a bounded burst.
