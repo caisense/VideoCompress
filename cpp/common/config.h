@@ -37,6 +37,12 @@ enum SnapshotCropMode {
     SNAPSHOT_CROP_FULL = 1,
 };
 
+enum RebuildReferenceMode {
+    REBUILD_REFERENCE_MODE_PERSON = 0,
+    REBUILD_REFERENCE_MODE_HEAD = 1,
+    REBUILD_REFERENCE_MODE_ADAPTIVE = 2,
+};
+
 struct SnapshotConfig {
     int udp_port;
     int jpeg_quality;
@@ -83,6 +89,17 @@ struct RebuildConfig {
     int patch_packets_per_frame;
     int crop_margin_percent;
     bool parity;
+    RebuildReferenceMode reference_mode;
+    int head_class_id;
+    float head_height_ratio;
+    float head_width_ratio;
+    int head_margin_percent;
+    int head_min_size;
+    int head_jpeg_quality;
+    int head_min_jpeg_quality;
+    std::string debug_reference_dir;
+    int debug_reference_max_samples;
+    bool debug_head_roi;
 
     RebuildConfig();
 };
@@ -261,6 +278,8 @@ const char *pipelineModeName(PipelineMode mode);
 const char *rateProfileName(RateProfile profile);
 bool parseRateProfile(const std::string &name, RateProfile *profile);
 void applyRateProfile(RateProfile profile, AppConfig *config);
+const char *rebuildReferenceModeName(RebuildReferenceMode mode);
+bool parseRebuildReferenceMode(const std::string &name, RebuildReferenceMode *mode);
 const char *transportModeName(TransportMode mode);
 bool parseTransportMode(const std::string &name, TransportMode *mode);
 

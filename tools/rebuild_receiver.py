@@ -29,7 +29,10 @@ STATE_SYNC_MAX_MS = 100
 STATE_EXTRAPOLATION_MAX_MS = 200
 SR_MODEL_INPUT_SIDE = 96
 REGISTRATION_MIN_AREA_RATIO = 0.70
-REGISTRATION_MAX_AREA_RATIO = 1.40
+# Head sub-crops must follow the same scale as their parent detector box.  A
+# normal 1.2x width/height change is 1.44x area, so 1.40 rejected the explicit
+# head mapping case and silently dropped valid local references.
+REGISTRATION_MAX_AREA_RATIO = 1.60
 REGISTRATION_MIN_SIDE_RATIO = 0.50
 REGISTRATION_MAX_SIDE_RATIO = 2.00
 
@@ -88,6 +91,14 @@ class VisualReference:
     received_at: float
     recovered_with_parity: bool
     pts_ms: int
+    reference_flags: int = 0
+    jpeg_width: int = 0
+    jpeg_height: int = 0
+    jpeg_bytes: int = 0
+
+    @property
+    def reference_kind(self) -> str:
+        return "HEAD" if self.reference_flags & rb.PACKET_FLAG_HEAD_REFERENCE else "FULL"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,7 +321,7 @@ class RebuildReceiver:
         if fragment is not None:
             try:
                 complete = self.assembler.add(packet.generation, packet.packet_type,
-                                              fragment, now)
+                                              fragment, now, packet.flags)
             except ValueError:
                 with self.lock:
                     self.invalid += 1
@@ -347,6 +358,10 @@ class RebuildReceiver:
                     image=image, mask=mask, received_at=complete.received_at,
                     recovered_with_parity=complete.recovered_with_parity,
                     pts_ms=packet.pts_ms,
+                    reference_flags=complete.reference_flags,
+                    jpeg_width=jpeg_width,
+                    jpeg_height=jpeg_height,
+                    jpeg_bytes=len(complete.jpeg),
                 )
             except (ValueError, cv2.error):
                 with self.lock:
@@ -1051,10 +1066,12 @@ class RebuildComposer:
                  reference_content_hard_max_age_ms: int =
                  REFERENCE_CONTENT_HARD_MAX_AGE_MS,
                  reference_future_max_ms: int = REFERENCE_FUTURE_MAX_MS,
-                 draw_targets: bool = False) -> None:
+                 draw_targets: bool = False,
+                 debug_reference_dir: Optional[Path] = None,
+                 debug_reference_max_samples: int = 100) -> None:
         if (reference_cache_ttl_ms <= 0 or
                 reference_content_hard_max_age_ms <= 0 or
-                reference_future_max_ms <= 0):
+                reference_future_max_ms <= 0 or debug_reference_max_samples < 0):
             raise ValueError("reference cache/content/future limits must be positive")
         self.output_size = output_size
         self.resolver = resolver or SuperResolver(enabled=False)
@@ -1062,6 +1079,12 @@ class RebuildComposer:
         self.reference_content_hard_max_age_ms = reference_content_hard_max_age_ms
         self.reference_future_max_ms = reference_future_max_ms
         self.draw_targets = draw_targets
+        self.debug_reference_dir = (None if debug_reference_dir is None else
+                                    Path(debug_reference_dir))
+        self.debug_reference_max_samples = debug_reference_max_samples
+        self._debug_reference_keys = set()
+        self._debug_artifact_keys = set()
+        self._debug_reference_error_reported = False
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rebuild-roi-sr")
         self.future: Optional[Future] = None
         self.job_key: Optional[tuple] = None
@@ -1107,6 +1130,16 @@ class RebuildComposer:
         self.last_ref_content_age_ms: Optional[int] = None
         self.last_reference_pts_ms: Optional[int] = None
         self.last_reference_generation: Optional[int] = None
+        self.last_reference_kind = "NONE"
+        self.last_reference_crop_src_width = 0
+        self.last_reference_crop_src_height = 0
+        self.last_reference_jpeg_width = 0
+        self.last_reference_jpeg_height = 0
+        self.last_reference_jpeg_quality = -1
+        self.last_reference_jpeg_bytes = 0
+        self.last_reference_jpeg_scale = 0.0
+        self.last_reference_head_pixels_width = 0
+        self.last_reference_head_pixels_height = 0
         self.last_state_reference_generation: Optional[int] = None
         self.last_track_id: Optional[int] = None
         self.last_match_score: Optional[float] = None
@@ -1145,6 +1178,43 @@ class RebuildComposer:
     def _reference_key(reference: VisualReference) -> tuple:
         return (reference.generation, reference.track_id,
                 reference.reference_generation)
+
+    def _debug_stem(self, reference: VisualReference) -> Optional[Path]:
+        if (self.debug_reference_dir is None or
+                self.debug_reference_max_samples <= 0):
+            return None
+        key = self._reference_key(reference)
+        if key not in self._debug_reference_keys:
+            if len(self._debug_reference_keys) >= self.debug_reference_max_samples:
+                return None
+            try:
+                self.debug_reference_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                if not self._debug_reference_error_reported:
+                    print(f"[Rebuild] debug reference directory unavailable: {error}",
+                          flush=True)
+                    self._debug_reference_error_reported = True
+                return None
+            self._debug_reference_keys.add(key)
+        return self.debug_reference_dir / (
+            f"track{reference.track_id}_gen{reference.reference_generation}_"
+            f"{reference.reference_kind}")
+
+    def _save_decoded_reference_debug(self, reference: VisualReference) -> None:
+        self._save_reference_artifact(reference, "decoded", reference.image)
+        self._save_reference_artifact(reference, "mask", reference.mask)
+
+    def _save_reference_artifact(self, reference: Optional[VisualReference],
+                                 suffix: str, image: np.ndarray) -> None:
+        if reference is None or image is None or image.size == 0:
+            return
+        artifact_key = (self._reference_key(reference), suffix)
+        if artifact_key in self._debug_artifact_keys:
+            return
+        stem = self._debug_stem(reference)
+        if stem is not None:
+            self._debug_artifact_keys.add(artifact_key)
+            cv2.imwrite(str(stem) + f"_{suffix}.png", image)
 
     def update_timing(self, video_rtp_timestamp: Optional[int],
                       pts_bias_ms: int = 0, generation: Optional[int] = None,
@@ -1334,6 +1404,7 @@ class RebuildComposer:
         keeps the executor latest-only when two targets refresh together.
         """
         self._poll()
+        self._save_decoded_reference_debug(reference)
         known = self._known_references.get((reference.generation, reference.track_id))
         if (known is None or reference.reference_generation == known.reference_generation or
                 RebuildReceiver._newer_u16(reference.reference_generation,
@@ -1394,6 +1465,7 @@ class RebuildComposer:
             else:
                 self.cache[key] = image
                 self.sr_done += 1
+                self._save_reference_artifact(reference, "sr", image)
                 if len(self.cache) > 8:
                     oldest = next(iter(self.cache))
                     if oldest != key:
@@ -1779,6 +1851,16 @@ class RebuildComposer:
         self.last_ref_content_age_ms = None
         self.last_reference_pts_ms = None
         self.last_reference_generation = None
+        self.last_reference_kind = "NONE"
+        self.last_reference_crop_src_width = 0
+        self.last_reference_crop_src_height = 0
+        self.last_reference_jpeg_width = 0
+        self.last_reference_jpeg_height = 0
+        self.last_reference_jpeg_quality = -1
+        self.last_reference_jpeg_bytes = 0
+        self.last_reference_jpeg_scale = 0.0
+        self.last_reference_head_pixels_width = 0
+        self.last_reference_head_pixels_height = 0
         self.last_state_reference_generation = None
         self.last_track_id = None
         self.last_match_score = None
@@ -1834,6 +1916,22 @@ class RebuildComposer:
                 self.last_ref_age = max(0.0, now - reference.received_at)
                 self.last_reference_pts_ms = reference.pts_ms
                 self.last_reference_generation = reference.reference_generation
+                self.last_reference_kind = reference.reference_kind
+                self.last_reference_crop_src_width = max(
+                    0, reference.crop[2] - reference.crop[0])
+                self.last_reference_crop_src_height = max(
+                    0, reference.crop[3] - reference.crop[1])
+                self.last_reference_jpeg_width = reference.jpeg_width or reference.image.shape[1]
+                self.last_reference_jpeg_height = reference.jpeg_height or reference.image.shape[0]
+                self.last_reference_jpeg_bytes = reference.jpeg_bytes
+                crop_width = max(1, self.last_reference_crop_src_width)
+                crop_height = max(1, self.last_reference_crop_src_height)
+                self.last_reference_jpeg_scale = min(
+                    self.last_reference_jpeg_width / float(crop_width),
+                    self.last_reference_jpeg_height / float(crop_height))
+                if reference.reference_kind == "HEAD":
+                    self.last_reference_head_pixels_width = self.last_reference_jpeg_width
+                    self.last_reference_head_pixels_height = self.last_reference_jpeg_height
                 if effective_video_rtp_timestamp is None:
                     self.timing_drops += 1
                     self._record_drop("STATE_NO_VIDEO_PTS")
@@ -1922,6 +2020,8 @@ class RebuildComposer:
                 x1 = min(output_width, x + crop_width)
                 y1 = min(output_height, y + crop_height)
                 if x1 > x0 and y1 > y0:
+                    self._save_reference_artifact(
+                        reference, "final", canvas[y0:y1, x0:x1].copy())
                     mask_roi = mask[y0 - y:y1 - y, x0 - x:x1 - x]
                     rebuilt_pixels[y0:y1, x0:x1] = np.maximum(
                         rebuilt_pixels[y0:y1, x0:x1], (mask_roi > 32).astype(np.uint8))
@@ -1990,6 +2090,16 @@ class RebuildComposer:
             "reference_content_age_ms": self.last_ref_content_age_ms,
             "reference_pts_ms": self.last_reference_pts_ms,
             "reference_generation": self.last_reference_generation,
+            "reference_kind": self.last_reference_kind,
+            "reference_crop_src_width": self.last_reference_crop_src_width,
+            "reference_crop_src_height": self.last_reference_crop_src_height,
+            "reference_jpeg_width": self.last_reference_jpeg_width,
+            "reference_jpeg_height": self.last_reference_jpeg_height,
+            "reference_jpeg_quality": self.last_reference_jpeg_quality,
+            "reference_jpeg_bytes": self.last_reference_jpeg_bytes,
+            "reference_jpeg_scale": self.last_reference_jpeg_scale,
+            "reference_head_pixels_width": self.last_reference_head_pixels_width,
+            "reference_head_pixels_height": self.last_reference_head_pixels_height,
             "state_reference_generation": self.last_state_reference_generation,
             "track_id": self.last_track_id,
             "rebuild_percent": self.last_rebuild_percent,

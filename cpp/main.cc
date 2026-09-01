@@ -739,9 +739,23 @@ int main(int argc, char **argv) {
                         "rebuild_ref_capture_send_us=%llu rebuild_ref_capture_p50_us=%llu "
                         "rebuild_ref_capture_p95_us=%llu "
                         "rebuild_ref_delivery_us=%llu rebuild_ref_delivery_p50_us=%llu "
-                        "rebuild_ref_delivery_p95_us=%llu rebuild_ref_bytes=%llu "
-                        "rebuild_ref_chunks=%llu rebuild_ref_fec_bytes=%llu "
-                        "rebuild_ref_interval_us=%llu rebuild_ref_interval_p50_us=%llu "
+                         "rebuild_ref_delivery_p95_us=%llu rebuild_ref_bytes=%llu "
+                         "rebuild_ref_chunks=%llu rebuild_ref_fec_bytes=%llu "
+                         "rebuild_ref_mode=%s rebuild_full_refs=%llu rebuild_head_refs=%llu "
+                         "rebuild_head_fallbacks=%llu rebuild_full_jpeg_bytes=%llu "
+                         "rebuild_head_jpeg_bytes=%llu rebuild_ref_kind=%s "
+                         "rebuild_head_selector=%s rebuild_head_fallback=%s "
+                         "rebuild_ref_crop_src_w=%d rebuild_ref_crop_src_h=%d "
+                         "rebuild_ref_jpeg_w=%d rebuild_ref_jpeg_h=%d "
+                         "rebuild_ref_jpeg_q=%d rebuild_ref_head_px_w=%d "
+                         "rebuild_ref_head_px_h=%d rebuild_ref_head_px_area=%llu "
+                         "rebuild_ref_jpeg_scale=%.4f rebuild_ref_gain_linear=%.4f "
+                         "rebuild_ref_gain_area=%.4f rebuild_ref_jpeg_p50=%llu "
+                         "rebuild_ref_jpeg_p95=%llu rebuild_ref_q_p50=%llu "
+                         "rebuild_ref_q_p95=%llu rebuild_ref_head_w_p50=%llu "
+                         "rebuild_ref_head_h_p50=%llu rebuild_ref_head_area_p50=%llu "
+                         "rebuild_ref_gain_linear_p50=%.4f rebuild_ref_gain_area_p50=%.4f "
+                         "rebuild_ref_interval_us=%llu rebuild_ref_interval_p50_us=%llu "
                         "rebuild_ref_interval_p95_us=%llu rebuild_ref_interval_max_us=%llu "
                         "rebuild_refresh_track=%u rebuild_ref_capture_age_ms=%d "
                         "rebuild_ref_ready_age_ms=%d rebuild_refresh_threshold_ms=%d "
@@ -802,10 +816,39 @@ int main(int argc, char **argv) {
                         static_cast<unsigned long long>(rebuild_tx.last_reference_delivery_us),
                         static_cast<unsigned long long>(rebuild_tx.reference_delivery_p50_us),
                         static_cast<unsigned long long>(rebuild_tx.reference_delivery_p95_us),
-                        static_cast<unsigned long long>(rebuild_tx.last_reference_blob_bytes),
-                        static_cast<unsigned long long>(rebuild_tx.last_reference_chunk_count),
-                        static_cast<unsigned long long>(rebuild_tx.last_reference_fec_bytes),
-                        static_cast<unsigned long long>(rebuild_tx.last_reference_interval_us),
+                         static_cast<unsigned long long>(rebuild_tx.last_reference_blob_bytes),
+                         static_cast<unsigned long long>(rebuild_tx.last_reference_chunk_count),
+                         static_cast<unsigned long long>(rebuild_tx.last_reference_fec_bytes),
+                         rebuild_tx.reference_mode.c_str(),
+                         static_cast<unsigned long long>(rebuild_tx.full_reference_transfers),
+                         static_cast<unsigned long long>(rebuild_tx.head_reference_transfers),
+                         static_cast<unsigned long long>(rebuild_tx.head_fallback_transfers),
+                         static_cast<unsigned long long>(rebuild_tx.full_jpeg_bytes),
+                         static_cast<unsigned long long>(rebuild_tx.head_jpeg_bytes),
+                         rebuild_tx.last_reference_kind.c_str(),
+                         rebuild_tx.last_head_selector_reason.c_str(),
+                         rebuild_tx.last_head_fallback_reason.c_str(),
+                         rebuild_tx.last_reference_crop_src_width,
+                         rebuild_tx.last_reference_crop_src_height,
+                         rebuild_tx.last_reference_jpeg_width,
+                         rebuild_tx.last_reference_jpeg_height,
+                         rebuild_tx.last_reference_jpeg_quality,
+                         rebuild_tx.last_reference_head_pixels_width,
+                         rebuild_tx.last_reference_head_pixels_height,
+                         static_cast<unsigned long long>(rebuild_tx.last_reference_head_pixels_area),
+                         rebuild_tx.last_reference_jpeg_scale,
+                         rebuild_tx.last_reference_head_pixel_gain_linear,
+                         rebuild_tx.last_reference_head_pixel_gain_area,
+                         static_cast<unsigned long long>(rebuild_tx.reference_jpeg_bytes_p50),
+                         static_cast<unsigned long long>(rebuild_tx.reference_jpeg_bytes_p95),
+                         static_cast<unsigned long long>(rebuild_tx.reference_jpeg_quality_p50),
+                         static_cast<unsigned long long>(rebuild_tx.reference_jpeg_quality_p95),
+                         static_cast<unsigned long long>(rebuild_tx.reference_head_pixels_width_p50),
+                         static_cast<unsigned long long>(rebuild_tx.reference_head_pixels_height_p50),
+                         static_cast<unsigned long long>(rebuild_tx.reference_head_pixels_area_p50),
+                         rebuild_tx.reference_head_pixel_gain_linear_p50,
+                         rebuild_tx.reference_head_pixel_gain_area_p50,
+                         static_cast<unsigned long long>(rebuild_tx.last_reference_interval_us),
                         static_cast<unsigned long long>(rebuild_tx.reference_interval_p50_us),
                         static_cast<unsigned long long>(rebuild_tx.reference_interval_p95_us),
                         static_cast<unsigned long long>(rebuild_tx.reference_interval_max_us),

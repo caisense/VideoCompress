@@ -15,6 +15,7 @@
 #include "common/config.h"
 #include "common/frame_meta.h"
 #include "transport/rebuild_refresh.h"
+#include "transport/rebuild_reference.h"
 #include "transport/rate_pacer.h"
 #include "transport/rebuild_protocol.h"
 
@@ -66,6 +67,40 @@ struct RebuildSenderSnapshot {
     uint64_t last_reference_blob_bytes;
     uint64_t last_reference_chunk_count;
     uint64_t last_reference_fec_bytes;
+    std::string reference_mode;
+    uint64_t full_reference_transfers;
+    uint64_t head_reference_transfers;
+    uint64_t head_fallback_transfers;
+    uint64_t full_jpeg_bytes;
+    uint64_t head_jpeg_bytes;
+    std::string last_reference_kind;
+    std::string last_head_selector_reason;
+    std::string last_head_fallback_reason;
+    int last_reference_crop_src_width;
+    int last_reference_crop_src_height;
+    int last_reference_jpeg_width;
+    int last_reference_jpeg_height;
+    int last_reference_jpeg_quality;
+    int last_reference_head_pixels_width;
+    int last_reference_head_pixels_height;
+    uint64_t last_reference_head_pixels_area;
+    double last_reference_jpeg_scale;
+    double last_reference_head_pixel_gain_linear;
+    double last_reference_head_pixel_gain_area;
+    uint64_t reference_jpeg_bytes_p50;
+    uint64_t reference_jpeg_bytes_p95;
+    uint64_t reference_jpeg_quality_p50;
+    uint64_t reference_jpeg_quality_p95;
+    uint64_t reference_head_pixels_width_p50;
+    uint64_t reference_head_pixels_width_p95;
+    uint64_t reference_head_pixels_height_p50;
+    uint64_t reference_head_pixels_height_p95;
+    uint64_t reference_head_pixels_area_p50;
+    uint64_t reference_head_pixels_area_p95;
+    double reference_head_pixel_gain_linear_p50;
+    double reference_head_pixel_gain_linear_p95;
+    double reference_head_pixel_gain_area_p50;
+    double reference_head_pixel_gain_area_p95;
     uint16_t last_refresh_track_id;
     int last_reference_capture_age_ms;
     int last_reference_ready_age_ms;
@@ -126,6 +161,25 @@ private:
         size_t track_index;
     };
 
+    struct ReferenceBuildTelemetry {
+        RebuildReferenceKind kind;
+        std::string selector_reason;
+        std::string fallback_reason;
+        int crop_src_width;
+        int crop_src_height;
+        int jpeg_width;
+        int jpeg_height;
+        int jpeg_quality;
+        int head_pixels_width;
+        int head_pixels_height;
+        uint64_t head_pixels_area;
+        double jpeg_scale;
+        double head_pixel_gain_linear;
+        double head_pixel_gain_area;
+
+        ReferenceBuildTelemetry();
+    };
+
     struct PendingReference {
         bool active;
         Request request;
@@ -142,6 +196,7 @@ private:
         size_t chunk_count;
         size_t fec_bytes;
         bool parity_sent;
+        ReferenceBuildTelemetry telemetry;
 
         PendingReference()
             : active(false), next_data_index(0), jpeg_bytes(0), capture_time_us(0),
@@ -163,7 +218,10 @@ private:
     bool sendPendingReferencePacket(std::string *error);
     bool buildReference(const Request &request, const ActiveTarget &active,
                         RebuildPatchFragment *metadata, std::vector<uint8_t> *blob,
-                        size_t *jpeg_bytes, std::string *error) const;
+                        size_t *jpeg_bytes, ReferenceBuildTelemetry *telemetry,
+                        std::string *error) const;
+    void recordReferenceTelemetry(const ReferenceBuildTelemetry &telemetry,
+                                  size_t jpeg_bytes);
     int estimatedReferenceDeliveryMs() const;
     void recordRefreshDecision(uint16_t track_id,
                                const RebuildRefreshDecision &decision);
@@ -199,7 +257,15 @@ private:
     std::vector<uint64_t> state_capture_to_send_samples_us_;
     std::vector<uint64_t> reference_delivery_samples_us_;
     std::vector<uint64_t> reference_interval_samples_us_;
+    std::vector<uint64_t> reference_jpeg_bytes_samples_;
+    std::vector<uint64_t> reference_jpeg_quality_samples_;
+    std::vector<uint64_t> reference_head_pixels_width_samples_;
+    std::vector<uint64_t> reference_head_pixels_height_samples_;
+    std::vector<uint64_t> reference_head_pixels_area_samples_;
+    std::vector<double> reference_head_pixel_gain_linear_samples_;
+    std::vector<double> reference_head_pixel_gain_area_samples_;
     std::map<uint16_t, uint64_t> previous_reference_capture_times_us_;
+    mutable size_t debug_reference_samples_written_;
 };
 
 }  // namespace roi_h265

@@ -587,6 +587,11 @@ def main() -> int:
                         help="maximum queued decoded frames while waiting for STATE")
     parser.add_argument("--rebuild-debug-timing", action="store_true",
                         help="emit one structured timing record per composed source frame")
+    parser.add_argument("--rebuild-debug-reference-dir", default="",
+                        help="save bounded decoded/SR/final reference samples")
+    parser.add_argument("--rebuild-debug-reference-max-samples", type=int, default=100)
+    parser.add_argument("--rebuild-record-path", default="",
+                        help="optional MP4 path for the composed rebuild output")
     parser.add_argument("--esrgan", choices=("auto", "off"), default="auto",
                         help="small-ROI Real-ESRGAN; auto falls back to Lanczos4")
     parser.add_argument("--esrgan-model", default=None)
@@ -606,7 +611,8 @@ def main() -> int:
             args.rebuild_reference_hard_age_ms <= 0 or
             args.rebuild_reference_future_ms <= 0 or args.rebuild_max_sync_ms <= 0 or
             args.rebuild_playout_delay_ms < 0 or args.rebuild_playout_max_frames < 2 or
-            args.esrgan_threads < 0 or args.esrgan_input_side < 16):
+            args.esrgan_threads < 0 or args.esrgan_input_side < 16 or
+            args.rebuild_debug_reference_max_samples < 0):
         parser.error("dimensions/rates/ages must be positive and playout/scale/threads valid")
 
     _, listen_port = parse_sdp(args.sdp)
@@ -631,7 +637,10 @@ def main() -> int:
         reference_cache_ttl_ms=args.rebuild_reference_cache_ttl_ms,
         reference_content_hard_max_age_ms=args.rebuild_reference_hard_age_ms,
         reference_future_max_ms=args.rebuild_reference_future_ms,
-        draw_targets=args.rebuild_boxes == "on")
+        draw_targets=args.rebuild_boxes == "on",
+        debug_reference_dir=(Path(args.rebuild_debug_reference_dir)
+                             if args.rebuild_debug_reference_dir else None),
+        debug_reference_max_samples=args.rebuild_debug_reference_max_samples)
     rebuild_playout = RebuildPlayoutBuffer(
         args.rebuild_playout_delay_ms, args.rebuild_playout_max_frames)
     if args.esrgan != "off" and args.rebuild_sr_warmup == "on":
@@ -788,6 +797,31 @@ def main() -> int:
     current_spatial = "BASE-LANCZOS"
     current_mode = "normal"
     last_sync_ms: Optional[int] = None
+    record_writer: Optional[cv2.VideoWriter] = None
+    record_failed = False
+
+    def record_rebuild_frame(image: np.ndarray) -> None:
+        nonlocal record_writer, record_failed
+        if not args.rebuild_record_path or record_failed or image is None or image.size == 0:
+            return
+        if record_writer is None:
+            output_path = Path(args.rebuild_record_path)
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                print(f"[Rebuild] output video directory unavailable: {error}", flush=True)
+                record_failed = True
+                return
+            record_writer = cv2.VideoWriter(
+                str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), args.rebuild_fps,
+                (int(image.shape[1]), int(image.shape[0])))
+            if not record_writer.isOpened():
+                print(f"[Rebuild] cannot open output video: {output_path}", flush=True)
+                record_writer.release()
+                record_writer = None
+                record_failed = True
+                return
+        record_writer.write(image)
     try:
         while not stopping.is_set():
             now = time.monotonic()
@@ -919,6 +953,16 @@ def main() -> int:
                             f"LOCAL_RGEN={'none' if local_rgen is None else local_rgen} "
                             f"STATE_RGEN={'none' if state_rgen is None else state_rgen} "
                             f"USED_RGEN={'none' if debug_values['reference_generation'] is None else debug_values['reference_generation']} "
+                            f"REF_KIND={debug_values['reference_kind']} "
+                            f"CROP_SRC_W={debug_values['reference_crop_src_width']} "
+                            f"CROP_SRC_H={debug_values['reference_crop_src_height']} "
+                            f"JPEG_W={debug_values['reference_jpeg_width']} "
+                            f"JPEG_H={debug_values['reference_jpeg_height']} "
+                            f"JPEG_Q={debug_values['reference_jpeg_quality']} "
+                            f"JPEG_BYTES={debug_values['reference_jpeg_bytes']} "
+                            f"JPEG_SCALE={debug_values['reference_jpeg_scale']:.4f} "
+                            f"HEADPX_W={debug_values['reference_head_pixels_width']} "
+                            f"HEADPX_H={debug_values['reference_head_pixels_height']} "
                             f"RGEN_LAG={'none' if rgen_lag is None else rgen_lag} "
                             f"RGEN={'none' if debug_values['reference_generation'] is None else debug_values['reference_generation']} "
                             f"REFREADY={debug_values['reference_ready']} "
@@ -952,6 +996,8 @@ def main() -> int:
                 if current_source_sequence is not None:
                     presentation.present(current_source_sequence, current_spatial,
                                          profile_generation, now)
+                    if current_canvas is not None:
+                        record_rebuild_frame(current_canvas)
             elif not is_rebuild:
                 if frame is not None and current_source_sequence != source_sequence:
                     current_canvas = postprocess_frame(
@@ -1006,6 +1052,14 @@ def main() -> int:
                             f" playout_drop={playout_values['dropped']}"
                             f" pts_bias_ms={rebuild_values['pts_bias_ms']}"
                             f" ref_pts_age_ms={composer_values['reference_content_age_ms']}"
+                            f" ref_kind={composer_values['reference_kind']}"
+                            f" ref_crop={composer_values['reference_crop_src_width']}x"
+                            f"{composer_values['reference_crop_src_height']}"
+                            f" ref_jpeg={composer_values['reference_jpeg_width']}x"
+                            f"{composer_values['reference_jpeg_height']}"
+                            f" ref_jpeg_bytes={composer_values['reference_jpeg_bytes']}"
+                            f" ref_head_px={composer_values['reference_head_pixels_width']}x"
+                            f"{composer_values['reference_head_pixels_height']}"
                             f" gen={profile['generation']}/"
                             f"{composer_values['reference_generation']}"
                             f" sr_run={int(composer_values['sr_running'])}"
@@ -1091,7 +1145,16 @@ def main() -> int:
                     f"FRAME {presentation_values['provenance']}",
                     f"TEMP HOLD {presentation_values['held_percent']:.1f}% "
                     f"({profile['fps']}->{output_fps})",
-                            f"REFREADY {composer_values['reference_ready']} USED "
+                            f"REF {composer_values['reference_kind']} C"
+                            f"{composer_values['reference_crop_src_width']}x"
+                            f"{composer_values['reference_crop_src_height']} J"
+                            f"{composer_values['reference_jpeg_width']}x"
+                            f"{composer_values['reference_jpeg_height']} Q"
+                            f"{composer_values['reference_jpeg_quality'] if composer_values['reference_jpeg_quality'] >= 0 else '-'} "
+                            f"{composer_values['reference_jpeg_bytes']}B H"
+                            f"{composer_values['reference_head_pixels_width']}x"
+                            f"{composer_values['reference_head_pixels_height']} READY "
+                            f"{composer_values['reference_ready']} USED "
                             f"{composer_values['refs_used']}/"
                             f"{rebuild_values['active_references']} AGE {ref_age_text} "
                             f"PTSAGE {ref_pts_age_text}",
@@ -1167,6 +1230,8 @@ def main() -> int:
         receiver.close()
         rebuild_receiver.close()
         rebuild_composer.close()
+        if record_writer is not None:
+            record_writer.release()
         with decoder_lock:
             stop_decoder_locked()
         if not args.headless:

@@ -21,6 +21,11 @@ enum RebuildPacketType {
 };
 
 const uint8_t kRebuildProtocolVersion = 1;
+// Packet flags are intentionally outside the repeated fragment metadata so the
+// 40-byte RB/1 layout and protocol version remain unchanged.  Old receivers
+// ignore the optional HEAD bit and continue to decode the crop coordinates.
+const uint16_t kRebuildPacketFlagParity = 0x0001;
+const uint16_t kRebuildPacketFlagHeadReference = 0x0002;
 const size_t kRebuildHeaderBytes = 28;
 const size_t kRebuildStateHeaderBytes = 12;
 const size_t kRebuildTargetStateBytes = 16;

@@ -39,7 +39,12 @@ RebuildConfig::RebuildConfig()
       patch_jpeg_quality(50), patch_max_bytes(800), patch_soft_refresh_ms(350),
       patch_hard_deadline_ms(450), patch_refresh_guard_ms(75),
       patch_chunk_bytes(1100), patch_packets_per_frame(2),
-      crop_margin_percent(20), parity(true) {}
+      crop_margin_percent(20), parity(true),
+      reference_mode(REBUILD_REFERENCE_MODE_PERSON), head_class_id(0),
+      head_height_ratio(0.45f), head_width_ratio(0.75f),
+      head_margin_percent(12), head_min_size(24), head_jpeg_quality(60),
+      head_min_jpeg_quality(45), debug_reference_dir(""),
+      debug_reference_max_samples(100), debug_head_roi(false) {}
 
 DetectionEventConfig::DetectionEventConfig()
     // A 44-byte ROEV/1 datagram is only emitted on a target-state transition;
@@ -184,6 +189,24 @@ const char *rateProfileName(RateProfile profile) {
     case RATE_PROFILE_REBUILD: return "rebuild";
     }
     return "unknown";
+}
+
+const char *rebuildReferenceModeName(RebuildReferenceMode mode) {
+    switch (mode) {
+    case REBUILD_REFERENCE_MODE_PERSON: return "person";
+    case REBUILD_REFERENCE_MODE_HEAD: return "head";
+    case REBUILD_REFERENCE_MODE_ADAPTIVE: return "adaptive";
+    }
+    return "unknown";
+}
+
+bool parseRebuildReferenceMode(const std::string &name, RebuildReferenceMode *mode) {
+    if (!mode) return false;
+    if (name == "person") *mode = REBUILD_REFERENCE_MODE_PERSON;
+    else if (name == "head") *mode = REBUILD_REFERENCE_MODE_HEAD;
+    else if (name == "adaptive") *mode = REBUILD_REFERENCE_MODE_ADAPTIVE;
+    else return false;
+    return true;
 }
 
 bool parseRateProfile(const std::string &name, RateProfile *profile) {
@@ -346,6 +369,42 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         else if (key == "rebuild-patch-packets-per-frame" && parseInt(value, &integer)) config->transport.rebuild.patch_packets_per_frame = integer;
         else if (key == "rebuild-crop-margin-percent" && parseInt(value, &integer)) config->transport.rebuild.crop_margin_percent = integer;
         else if (key == "rebuild-parity" && parseBool(value, &boolean)) config->transport.rebuild.parity = boolean;
+        else if (key == "rebuild-reference-mode") {
+            if (!parseRebuildReferenceMode(value, &config->transport.rebuild.reference_mode)) {
+                if (error) *error = "rebuild reference mode must be person, head, or adaptive";
+                return false;
+            }
+        }
+        else if (key == "rebuild-head-class-id" && parseInt(value, &integer)) {
+            config->transport.rebuild.head_class_id = integer;
+        }
+        else if (key == "rebuild-head-height-ratio" && parseFloat(value, &decimal)) {
+            config->transport.rebuild.head_height_ratio = decimal;
+        }
+        else if (key == "rebuild-head-width-ratio" && parseFloat(value, &decimal)) {
+            config->transport.rebuild.head_width_ratio = decimal;
+        }
+        else if (key == "rebuild-head-margin-percent" && parseInt(value, &integer)) {
+            config->transport.rebuild.head_margin_percent = integer;
+        }
+        else if (key == "rebuild-head-min-size" && parseInt(value, &integer)) {
+            config->transport.rebuild.head_min_size = integer;
+        }
+        else if (key == "rebuild-head-jpeg-quality" && parseInt(value, &integer)) {
+            config->transport.rebuild.head_jpeg_quality = integer;
+        }
+        else if (key == "rebuild-head-min-jpeg-quality" && parseInt(value, &integer)) {
+            config->transport.rebuild.head_min_jpeg_quality = integer;
+        }
+        else if (key == "rebuild-debug-reference-dir") {
+            config->transport.rebuild.debug_reference_dir = value;
+        }
+        else if (key == "rebuild-debug-reference-max-samples" && parseInt(value, &integer)) {
+            config->transport.rebuild.debug_reference_max_samples = integer;
+        }
+        else if (key == "rebuild-debug-head-roi" && parseBool(value, &boolean)) {
+            config->transport.rebuild.debug_head_roi = boolean;
+        }
         else if (key == "event-push" && parseBool(value, &boolean)) config->transport.event.enabled = boolean;
         else if (key == "event-udp-port" && parseInt(value, &integer)) config->transport.event.udp_port = integer;
         else if (key == "event-min-confidence" && parseFloat(value, &decimal)) config->transport.event.min_confidence = decimal;
@@ -446,9 +505,27 @@ bool parseAppConfig(int argc, char **argv, AppConfig *config, std::string *error
         config->transport.rebuild.patch_chunk_bytes > config->transport.mtu - 100 ||
         config->transport.rebuild.patch_packets_per_frame < 1 ||
         config->transport.rebuild.patch_packets_per_frame > 2 ||
-        config->transport.rebuild.crop_margin_percent < 0 ||
-        config->transport.rebuild.crop_margin_percent > 100 ||
-        config->transport.event.udp_port < 1 || config->transport.event.udp_port > 65535 ||
+         config->transport.rebuild.crop_margin_percent < 0 ||
+         config->transport.rebuild.crop_margin_percent > 100 ||
+         (config->transport.rebuild.reference_mode != REBUILD_REFERENCE_MODE_PERSON &&
+          config->transport.rebuild.reference_mode != REBUILD_REFERENCE_MODE_HEAD &&
+          config->transport.rebuild.reference_mode != REBUILD_REFERENCE_MODE_ADAPTIVE) ||
+         config->transport.rebuild.head_class_id < 0 ||
+         config->transport.rebuild.head_class_id > 255 ||
+         !(config->transport.rebuild.head_height_ratio > 0.0f) ||
+         config->transport.rebuild.head_height_ratio > 1.0f ||
+         !(config->transport.rebuild.head_width_ratio > 0.0f) ||
+         config->transport.rebuild.head_width_ratio > 1.0f ||
+         config->transport.rebuild.head_margin_percent < 0 ||
+         config->transport.rebuild.head_margin_percent > 100 ||
+         config->transport.rebuild.head_min_size <= 0 ||
+         config->transport.rebuild.head_jpeg_quality < 1 ||
+         config->transport.rebuild.head_jpeg_quality > 100 ||
+         config->transport.rebuild.head_min_jpeg_quality < 1 ||
+         config->transport.rebuild.head_min_jpeg_quality >
+             config->transport.rebuild.head_jpeg_quality ||
+         config->transport.rebuild.debug_reference_max_samples < 0 ||
+         config->transport.event.udp_port < 1 || config->transport.event.udp_port > 65535 ||
         config->transport.event.udp_port == config->transport.udp_port ||
         config->transport.event.udp_port == config->transport.snapshot.udp_port ||
         config->transport.event.udp_port == config->transport.rebuild.udp_port ||

@@ -77,6 +77,13 @@ g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
 "$out_dir/test_rebuild_protocol"
 
 g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
+  "$cpp_dir/common/config.cc" \
+  "$cpp_dir/transport/rebuild_reference.cc" \
+  "$cpp_dir/tests/test_rebuild_reference.cc" \
+  -o "$out_dir/test_rebuild_reference"
+"$out_dir/test_rebuild_reference"
+
+g++ -std=c++11 -Wall -Wextra -Werror -pthread -I"$cpp_dir" \
   "$cpp_dir/tests/test_rebuild_refresh.cc" \
   -o "$out_dir/test_rebuild_refresh"
 "$out_dir/test_rebuild_refresh"

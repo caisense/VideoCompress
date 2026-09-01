@@ -17,6 +17,11 @@ STATE = 1
 PATCH_DATA = 2
 PATCH_PARITY = 3
 HEARTBEAT = 4
+# Packet flags are optional metadata.  The parity bit is sender-local; the
+# HEAD bit describes the reference crop and is safe for old receivers to ignore
+# because crop coordinates remain in the unchanged 40-byte fragment header.
+PACKET_FLAG_PARITY = 0x0001
+PACKET_FLAG_HEAD_REFERENCE = 0x0002
 HEADER_BYTES = 28
 STATE_HEADER_BYTES = 12
 TARGET_BYTES = 16
@@ -111,6 +116,7 @@ class CompleteReference:
     jpeg: bytes
     recovered_with_parity: bool
     received_at: float
+    reference_flags: int = 0
 
 
 def crc32(data: bytes) -> int:
@@ -265,6 +271,7 @@ class FragmentAssembler:
         data: Dict[int, bytes]
         parity: Optional[bytes]
         updated: float
+        reference_flags: int
 
     def __init__(self, timeout_seconds: float = 1.5, max_transfers: int = 16) -> None:
         self.timeout_seconds = timeout_seconds
@@ -304,7 +311,8 @@ class FragmentAssembler:
         }
 
     def add(self, generation: int, packet_type: int, fragment: PatchFragment,
-            now: Optional[float] = None) -> Optional[CompleteReference]:
+            now: Optional[float] = None, packet_flags: int = 0
+            ) -> Optional[CompleteReference]:
         now = time.monotonic() if now is None else now
         self._expire(now)
         key = (generation, fragment.transfer_id)
@@ -315,9 +323,14 @@ class FragmentAssembler:
             return None
         transfer = self.transfers.get(key)
         if transfer is None:
-            transfer = self._Transfer(fragment, {}, None, now)
+            transfer = self._Transfer(fragment, {}, None, now,
+                                      packet_flags & PACKET_FLAG_HEAD_REFERENCE)
             self.transfers[key] = transfer
         elif self._signature(transfer.metadata) != self._signature(fragment):
+            del self.transfers[key]
+            self.inconsistent += 1
+            return None
+        elif transfer.reference_flags != (packet_flags & PACKET_FLAG_HEAD_REFERENCE):
             del self.transfers[key]
             self.inconsistent += 1
             return None
@@ -381,4 +394,5 @@ class FragmentAssembler:
         jpeg = blob[fragment.mask_rle_bytes:]
         if not jpeg:
             return None
-        return CompleteReference(generation, fragment, mask_rle, jpeg, recovered, now)
+        return CompleteReference(generation, fragment, mask_rle, jpeg, recovered, now,
+                                 transfer.reference_flags)

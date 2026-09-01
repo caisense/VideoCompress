@@ -146,6 +146,27 @@ class RebuildProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CRC32"):
             rb.parse_packet(bytes(corrupt))
 
+    def test_head_reference_flag_survives_data_assembly_without_wire_layout_change(self):
+        blob = b"\x02\x01jpeg"
+        chunk = 3
+        assembler = rb.FragmentAssembler()
+        complete = None
+        count = (len(blob) + chunk - 1) // chunk
+        for index in range(count):
+            fragment = make_fragment(blob, index, count, chunk,
+                                     blob[index * chunk:(index + 1) * chunk])
+            complete = assembler.add(
+                5, rb.PATCH_DATA, fragment, now=1.0 + index * 0.01,
+                packet_flags=rb.PACKET_FLAG_HEAD_REFERENCE)
+        self.assertIsNotNone(complete)
+        self.assertEqual(complete.reference_flags, rb.PACKET_FLAG_HEAD_REFERENCE)
+        packet = rb.Packet(rb.PATCH_DATA, rb.PROFILE_REBUILD, 5,
+                           rb.PACKET_FLAG_HEAD_REFERENCE, 10, 1, 1000,
+                           rb.build_fragment(make_fragment(blob, 0, count, chunk,
+                                                            blob[:chunk])))
+        decoded = rb.parse_packet(rb.build_packet(packet))
+        self.assertEqual(decoded.flags, rb.PACKET_FLAG_HEAD_REFERENCE)
+
     def test_receiver_rejects_old_generation_without_rolling_back(self):
         empty = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, ())
         receiver = RebuildReceiver()
@@ -656,6 +677,27 @@ class RebuildProtocolTests(unittest.TestCase):
         finally:
             miss.close()
             hit.close()
+
+    def test_head_crop_registration_maps_to_upper_target_without_full_bbox_stretch(self):
+        reference = VisualReference(
+            generation=5, track_id=4, reference_generation=2,
+            crop=(140, 50, 260, 210),
+            reference_bbox=(100, 50, 300, 450),
+            image=np.zeros((96, 72, 3), dtype=np.uint8),
+            mask=np.full((64, 64), 255, dtype=np.uint8),
+            received_at=10.0, recovered_with_parity=False, pts_ms=1000,
+            reference_flags=rb.PACKET_FLAG_HEAD_REFERENCE,
+            jpeg_width=72, jpeg_height=96, jpeg_bytes=721)
+        target = rb.TargetState(4, 0, 91, 150, 70, 390, 550, 2, 1)
+        result = RebuildComposer._registration_details(
+            reference, target, 1.0, 0.75, output_size=(640, 360))
+        self.assertEqual(result.reason, "NONE")
+        self.assertIsNotNone(result.crop)
+        left, top, right, bottom = result.crop
+        self.assertEqual((left, top, right, bottom), (198, 52, 342, 196))
+        self.assertLess(right - left, int((target.right - target.left) * 1.0))
+        self.assertLess(bottom - top, int((target.bottom - target.top) * 0.75))
+        self.assertEqual(reference.reference_kind, "HEAD")
 
     def test_sr_handover_keeps_only_a_valid_old_same_track_esrgan_reference(self):
         class SrResolver:

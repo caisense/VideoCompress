@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
 
 #include <arpa/inet.h>
@@ -12,6 +13,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "transport/snapshot_protocol.h"
@@ -52,6 +54,78 @@ uint64_t percentile(const std::vector<uint64_t> &values, double fraction) {
     const size_t index = std::min(sorted.size() - 1,
         static_cast<size_t>(std::ceil(fraction * sorted.size()) - 1.0));
     return sorted[index];
+}
+
+double percentileDouble(const std::vector<double> &values, double fraction) {
+    if (values.empty()) return 0.0;
+    std::vector<double> sorted(values);
+    std::sort(sorted.begin(), sorted.end());
+    const size_t index = std::min(sorted.size() - 1,
+        static_cast<size_t>(std::ceil(fraction * sorted.size()) - 1.0));
+    return sorted[index];
+}
+
+struct EncodedReference {
+    std::vector<uint8_t> jpeg;
+    int width;
+    int height;
+    int quality;
+    double scale;
+
+    EncodedReference() : width(0), height(0), quality(0), scale(1.0) {}
+};
+
+bool encodeReferenceJpeg(const cv::Mat &bgr, const RebuildConfig &config,
+                         RebuildReferenceKind kind, EncodedReference *result,
+                         std::string *error) {
+    if (!result || bgr.empty() || bgr.cols <= 0 || bgr.rows <= 0) {
+        if (error) *error = "invalid rebuild JPEG input";
+        return false;
+    }
+    const bool head = kind == REFERENCE_KIND_HEAD_PRIORITY;
+    const int initial_quality = head ? config.head_jpeg_quality : config.patch_jpeg_quality;
+    const int minimum_quality = head ? config.head_min_jpeg_quality : 40;
+    double scale = std::min(1.0, static_cast<double>(config.patch_max_side) /
+        std::max(bgr.cols, bgr.rows));
+    int quality = initial_quality;
+    for (int attempt = 0; attempt < 24; ++attempt) {
+        const int resized_width = std::max(16, static_cast<int>(bgr.cols * scale + 0.5));
+        const int resized_height = std::max(16, static_cast<int>(bgr.rows * scale + 0.5));
+        cv::Mat resized;
+        cv::resize(bgr, resized, cv::Size(resized_width, resized_height), 0.0, 0.0,
+                   scale < 1.0 ? cv::INTER_AREA : cv::INTER_LINEAR);
+        std::vector<int> options;
+        options.push_back(cv::IMWRITE_JPEG_QUALITY);
+        options.push_back(quality);
+        options.push_back(cv::IMWRITE_JPEG_OPTIMIZE);
+        options.push_back(1);
+        if (!cv::imencode(".jpg", resized, result->jpeg, options) ||
+            result->jpeg.empty()) {
+            if (error) *error = "OpenCV rebuild JPEG encoding failed";
+            return false;
+        }
+        result->width = resized_width;
+        result->height = resized_height;
+        result->quality = quality;
+        result->scale = std::min(resized_width / static_cast<double>(bgr.cols),
+                                 resized_height / static_cast<double>(bgr.rows));
+        if (result->jpeg.size() <= static_cast<size_t>(config.patch_max_bytes)) return true;
+        if (quality > minimum_quality) {
+            quality = std::max(minimum_quality, quality - (head ? 5 : 7));
+            continue;
+        }
+        const double next_scale = scale * 0.82;
+        if (next_scale >= scale * 0.999) break;
+        scale = next_scale;
+    }
+    if (error) *error = "rebuild JPEG cannot meet configured byte cap";
+    return false;
+}
+
+void writeBinaryFile(const std::string &path, const std::vector<uint8_t> &bytes) {
+    std::ofstream output(path.c_str(), std::ios::binary);
+    if (output) output.write(reinterpret_cast<const char *>(bytes.data()),
+                             static_cast<std::streamsize>(bytes.size()));
 }
 
 std::vector<uint8_t> runLengthEncodeMask(const cv::Mat &mask) {
@@ -102,11 +176,34 @@ RebuildSenderSnapshot::RebuildSenderSnapshot()
       reference_interval_p50_us(0), reference_interval_p95_us(0),
       reference_interval_max_us(0), last_reference_blob_bytes(0),
       last_reference_chunk_count(0), last_reference_fec_bytes(0),
+      reference_mode("person"), full_reference_transfers(0),
+      head_reference_transfers(0), head_fallback_transfers(0), full_jpeg_bytes(0),
+      head_jpeg_bytes(0), last_reference_kind("NONE"),
+      last_head_selector_reason("NONE"), last_head_fallback_reason("NONE"),
+      last_reference_crop_src_width(0), last_reference_crop_src_height(0),
+      last_reference_jpeg_width(0), last_reference_jpeg_height(0),
+      last_reference_jpeg_quality(0), last_reference_head_pixels_width(0),
+      last_reference_head_pixels_height(0), last_reference_head_pixels_area(0),
+      last_reference_jpeg_scale(0.0), last_reference_head_pixel_gain_linear(0.0),
+      last_reference_head_pixel_gain_area(0.0), reference_jpeg_bytes_p50(0),
+      reference_jpeg_bytes_p95(0), reference_jpeg_quality_p50(0),
+      reference_jpeg_quality_p95(0), reference_head_pixels_width_p50(0),
+      reference_head_pixels_width_p95(0), reference_head_pixels_height_p50(0),
+      reference_head_pixels_height_p95(0), reference_head_pixels_area_p50(0),
+      reference_head_pixels_area_p95(0), reference_head_pixel_gain_linear_p50(0.0),
+      reference_head_pixel_gain_linear_p95(0.0), reference_head_pixel_gain_area_p50(0.0),
+      reference_head_pixel_gain_area_p95(0.0),
       last_refresh_track_id(0), last_reference_capture_age_ms(0),
       last_reference_ready_age_ms(0), last_refresh_threshold_ms(0),
       last_estimated_delivery_ms(0), last_refresh_deadline_ms(0),
       last_refresh_quantum_ms(0), last_refresh_decision_start(false),
       last_refresh_reason("NO_ACTIVE_TARGET") {}
+
+RebuildSender::ReferenceBuildTelemetry::ReferenceBuildTelemetry()
+    : kind(REFERENCE_KIND_FULL), crop_src_width(0), crop_src_height(0),
+      jpeg_width(0), jpeg_height(0), jpeg_quality(0), head_pixels_width(0),
+      head_pixels_height(0), head_pixels_area(0), jpeg_scale(0.0),
+      head_pixel_gain_linear(1.0), head_pixel_gain_area(1.0) {}
 
 RebuildSender::Track::Track()
     : id(0), class_id(-1), confidence(0.0f), last_seen_frame(0),
@@ -119,7 +216,9 @@ RebuildSender::RebuildSender(const RebuildConfig &config, const std::string &hos
       destination_(NULL), started_(false), stopping_(false), enabled_(false),
       transmitting_(false), failed_(false), active_generation_(0),
       has_generation_(false), next_track_id_(1), next_transfer_id_(1),
-      next_packet_sequence_(1) {}
+      next_packet_sequence_(1), debug_reference_samples_written_(0) {
+    snapshot_.reference_mode = rebuildReferenceModeName(config_.reference_mode);
+}
 
 RebuildSender::~RebuildSender() { stop(); }
 
@@ -402,59 +501,54 @@ bool RebuildSender::sendState(const Request &request,
 bool RebuildSender::buildReference(const Request &request, const ActiveTarget &active,
                                    RebuildPatchFragment *metadata,
                                    std::vector<uint8_t> *blob, size_t *jpeg_bytes,
+                                   ReferenceBuildTelemetry *telemetry,
                                    std::string *error) const {
     if (!metadata || !blob || !jpeg_bytes || active.instance_index >=
-        request.segmentation.instances.size() || active.track_index >= tracks_.size()) {
+        request.segmentation.instances.size() || active.track_index >= tracks_.size() ||
+        !telemetry) {
         if (error) *error = "invalid rebuild reference target";
         return false;
     }
     const SegInstance &instance = request.segmentation.instances[active.instance_index];
     const Track &track = tracks_[active.track_index];
-    const int box_width = std::max(1, instance.bbox.right - instance.bbox.left);
-    const int box_height = std::max(1, instance.bbox.bottom - instance.bbox.top);
-    const int margin_x = (box_width * config_.crop_margin_percent + 99) / 100;
-    const int margin_y = (box_height * config_.crop_margin_percent + 99) / 100;
-    const int left = std::max(0, instance.bbox.left - margin_x);
-    const int top = std::max(0, instance.bbox.top - margin_y);
-    const int right = std::min(request.frame->source_width, instance.bbox.right + margin_x);
-    const int bottom = std::min(request.frame->source_height, instance.bbox.bottom + margin_y);
-    if (right <= left || bottom <= top) {
+    const ReferenceCropSelection selection = selectReferenceCrop(
+        instance, request.frame->source_width, request.frame->source_height, config_);
+    if (!selection.valid || selection.crop.right <= selection.crop.left ||
+        selection.crop.bottom <= selection.crop.top) {
         if (error) *error = "empty rebuild reference crop";
         return false;
     }
+    const int left = selection.crop.left;
+    const int top = selection.crop.top;
+    const int right = selection.crop.right;
+    const int bottom = selection.crop.bottom;
     const cv::Mat rgb(request.frame->source_height, request.frame->source_width, CV_8UC3,
                       const_cast<uint8_t *>(request.frame->rgb.data()));
     cv::Mat bgr;
     cv::cvtColor(rgb(cv::Rect(left, top, right - left, bottom - top)),
                  bgr, cv::COLOR_RGB2BGR);
-    double scale = std::min(1.0, static_cast<double>(config_.patch_max_side) /
-        std::max(bgr.cols, bgr.rows));
-    int quality = config_.patch_jpeg_quality;
-    std::vector<uint8_t> jpeg;
-    for (int attempt = 0; attempt < 12; ++attempt) {
-        const int resized_width = std::max(16, static_cast<int>(bgr.cols * scale + 0.5));
-        const int resized_height = std::max(16, static_cast<int>(bgr.rows * scale + 0.5));
-        cv::Mat resized;
-        cv::resize(bgr, resized, cv::Size(resized_width, resized_height), 0.0, 0.0,
-                   scale < 1.0 ? cv::INTER_AREA : cv::INTER_LINEAR);
-        std::vector<int> options;
-        options.push_back(cv::IMWRITE_JPEG_QUALITY);
-        options.push_back(quality);
-        options.push_back(cv::IMWRITE_JPEG_OPTIMIZE);
-        options.push_back(1);
-        if (!cv::imencode(".jpg", resized, jpeg, options) || jpeg.empty()) {
-            if (error) *error = "OpenCV rebuild JPEG encoding failed";
-            return false;
-        }
-        metadata->jpeg_width = clampU16(resized_width);
-        metadata->jpeg_height = clampU16(resized_height);
-        if (jpeg.size() <= static_cast<size_t>(config_.patch_max_bytes)) break;
-        if (quality > 40) quality = std::max(40, quality - 7);
-        else scale *= 0.82;
-    }
-    if (jpeg.size() > static_cast<size_t>(config_.patch_max_bytes)) {
-        if (error) *error = "rebuild JPEG cannot meet configured byte cap";
+    EncodedReference encoded;
+    if (!encodeReferenceJpeg(bgr, config_, selection.kind, &encoded, error)) {
         return false;
+    }
+
+    // Compute the density gain against the exact FULL policy for this same
+    // source frame.  This is telemetry only; the hypothetical FULL JPEG is
+    // never sent and therefore cannot consume the 100 kbps pacer.
+    const ReferenceCropSelection full_selection = selectFullReferenceCrop(
+        instance.bbox, request.frame->source_width, request.frame->source_height,
+        config_.crop_margin_percent);
+    EncodedReference full_encoded;
+    bool have_full_encoding = false;
+    if (selection.kind == REFERENCE_KIND_HEAD_PRIORITY && full_selection.valid) {
+        const BBox &full_crop = full_selection.crop;
+        cv::Mat full_bgr;
+        cv::cvtColor(rgb(cv::Rect(full_crop.left, full_crop.top,
+                                  full_crop.right - full_crop.left,
+                                  full_crop.bottom - full_crop.top)),
+                     full_bgr, cv::COLOR_RGB2BGR);
+        have_full_encoding = encodeReferenceJpeg(
+            full_bgr, config_, REFERENCE_KIND_FULL, &full_encoded, NULL);
     }
 
     // 64x64 retains the subject silhouette at the receiver.  The previous
@@ -494,15 +588,16 @@ bool RebuildSender::buildReference(const Request &request, const ActiveTarget &a
                0.0, 0.0, cv::INTER_NEAREST);
     cv::threshold(small_mask, small_mask, 0, 255, cv::THRESH_BINARY);
     const std::vector<uint8_t> mask_rle = runLengthEncodeMask(small_mask);
-    if (mask_rle.size() > 65535U || mask_rle.size() + jpeg.size() > 65535U) {
+    if (mask_rle.size() > 65535U ||
+        mask_rle.size() + encoded.jpeg.size() > 65535U) {
         if (error) *error = "rebuild mask/JPEG blob exceeds protocol limit";
         return false;
     }
     blob->clear();
-    blob->reserve(mask_rle.size() + jpeg.size());
+    blob->reserve(mask_rle.size() + encoded.jpeg.size());
     blob->insert(blob->end(), mask_rle.begin(), mask_rle.end());
-    blob->insert(blob->end(), jpeg.begin(), jpeg.end());
-    *jpeg_bytes = jpeg.size();
+    blob->insert(blob->end(), encoded.jpeg.begin(), encoded.jpeg.end());
+    *jpeg_bytes = encoded.jpeg.size();
     metadata->track_id = track.id;
     metadata->reference_generation = static_cast<uint16_t>(track.reference_generation + 1U);
     if (metadata->reference_generation == 0) metadata->reference_generation = 1;
@@ -529,11 +624,95 @@ bool RebuildSender::buildReference(const Request &request, const ActiveTarget &a
     metadata->reference_top = clampU16(reference_top);
     metadata->reference_right = clampU16(reference_right);
     metadata->reference_bottom = clampU16(reference_bottom);
+    metadata->jpeg_width = clampU16(encoded.width);
+    metadata->jpeg_height = clampU16(encoded.height);
     metadata->mask_width = mask_side;
     metadata->mask_height = mask_side;
     metadata->blob_size = static_cast<uint32_t>(blob->size());
     metadata->mask_rle_bytes = static_cast<uint16_t>(mask_rle.size());
     metadata->chunk_bytes = static_cast<uint16_t>(config_.patch_chunk_bytes);
+
+    const BBox focus = selection.focus;
+    const int focus_width = std::max(1, focus.right - focus.left);
+    const int focus_height = std::max(1, focus.bottom - focus.top);
+    const int head_pixels_width = std::max(1, static_cast<int>(std::round(
+        focus_width * encoded.width / static_cast<double>(right - left))));
+    const int head_pixels_height = std::max(1, static_cast<int>(std::round(
+        focus_height * encoded.height / static_cast<double>(bottom - top))));
+    uint64_t full_head_area = 0;
+    if (full_selection.valid) {
+        const BBox full_focus = full_selection.focus;
+        const int full_crop_width = std::max(1, full_selection.crop.right -
+            full_selection.crop.left);
+        const int full_crop_height = std::max(1, full_selection.crop.bottom -
+            full_selection.crop.top);
+        const int full_jpeg_width = have_full_encoding ? full_encoded.width :
+            std::max(16, static_cast<int>(full_crop_width * std::min(
+                1.0, static_cast<double>(config_.patch_max_side) /
+                    std::max(full_crop_width, full_crop_height)) + 0.5));
+        const int full_jpeg_height = have_full_encoding ? full_encoded.height :
+            std::max(16, static_cast<int>(full_crop_height * std::min(
+                1.0, static_cast<double>(config_.patch_max_side) /
+                    std::max(full_crop_width, full_crop_height)) + 0.5));
+        const uint64_t full_head_width = static_cast<uint64_t>(std::max(1,
+            static_cast<int>(std::round((full_focus.right - full_focus.left) *
+                full_jpeg_width / static_cast<double>(full_crop_width)))));
+        const uint64_t full_head_height = static_cast<uint64_t>(std::max(1,
+            static_cast<int>(std::round((full_focus.bottom - full_focus.top) *
+                full_jpeg_height / static_cast<double>(full_crop_height)))));
+        full_head_area = full_head_width * full_head_height;
+    }
+    telemetry->kind = selection.kind;
+    telemetry->selector_reason = selection.selector_reason.empty()
+        ? "NONE" : selection.selector_reason;
+    telemetry->fallback_reason = selection.fallback_reason.empty()
+        ? "NONE" : selection.fallback_reason;
+    telemetry->crop_src_width = right - left;
+    telemetry->crop_src_height = bottom - top;
+    telemetry->jpeg_width = encoded.width;
+    telemetry->jpeg_height = encoded.height;
+    telemetry->jpeg_quality = encoded.quality;
+    telemetry->head_pixels_width = head_pixels_width;
+    telemetry->head_pixels_height = head_pixels_height;
+    telemetry->head_pixels_area = static_cast<uint64_t>(head_pixels_width) *
+        static_cast<uint64_t>(head_pixels_height);
+    telemetry->jpeg_scale = encoded.scale;
+    if (selection.kind == REFERENCE_KIND_HEAD_PRIORITY && full_head_area > 0) {
+        telemetry->head_pixel_gain_area = static_cast<double>(telemetry->head_pixels_area) /
+            static_cast<double>(full_head_area);
+        telemetry->head_pixel_gain_linear = std::sqrt(
+            std::max(0.0, telemetry->head_pixel_gain_area));
+    } else {
+        telemetry->head_pixel_gain_linear = 1.0;
+        telemetry->head_pixel_gain_area = 1.0;
+    }
+
+    if (!config_.debug_reference_dir.empty() && config_.debug_reference_max_samples > 0 &&
+        debug_reference_samples_written_ < static_cast<size_t>(
+            config_.debug_reference_max_samples)) {
+        mkdir(config_.debug_reference_dir.c_str(), 0755);
+        const std::string stem = config_.debug_reference_dir + "/track" +
+            std::to_string(track.id) + "_gen" +
+            std::to_string(metadata->reference_generation) + "_" +
+            rebuildReferenceKindName(selection.kind);
+        cv::imwrite(stem + "_source.png", bgr);
+        writeBinaryFile(stem + "_jpeg.jpg", encoded.jpeg);
+        if (config_.debug_head_roi) {
+            cv::Mat overlay;
+            cv::cvtColor(rgb, overlay, cv::COLOR_RGB2BGR);
+            const auto drawBox = [&overlay](const BBox &box, const cv::Scalar &color) {
+                if (box.right > box.left && box.bottom > box.top) {
+                    cv::rectangle(overlay, cv::Point(box.left, box.top),
+                                  cv::Point(box.right - 1, box.bottom - 1), color, 2);
+                }
+            };
+            drawBox(selection.parent_bbox, cv::Scalar(0, 255, 0));
+            drawBox(selection.crop, cv::Scalar(255, 0, 0));
+            drawBox(selection.focus, cv::Scalar(0, 0, 255));
+            cv::imwrite(stem + "_selector.png", overlay);
+        }
+        ++debug_reference_samples_written_;
+    }
     return true;
 }
 
@@ -582,6 +761,86 @@ void RebuildSender::recordRefreshDecision(
     snapshot_.last_refresh_reason = rebuildRefreshReasonName(decision.reason);
 }
 
+void RebuildSender::recordReferenceTelemetry(
+        const ReferenceBuildTelemetry &telemetry, size_t jpeg_bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.reference_mode = rebuildReferenceModeName(config_.reference_mode);
+    if (telemetry.kind == REFERENCE_KIND_HEAD_PRIORITY) {
+        ++snapshot_.head_reference_transfers;
+        snapshot_.head_jpeg_bytes += jpeg_bytes;
+    } else {
+        ++snapshot_.full_reference_transfers;
+        snapshot_.full_jpeg_bytes += jpeg_bytes;
+        if (telemetry.fallback_reason != "NONE") ++snapshot_.head_fallback_transfers;
+    }
+    snapshot_.last_reference_kind = rebuildReferenceKindName(telemetry.kind);
+    snapshot_.last_head_selector_reason = telemetry.selector_reason;
+    snapshot_.last_head_fallback_reason = telemetry.fallback_reason;
+    snapshot_.last_reference_crop_src_width = telemetry.crop_src_width;
+    snapshot_.last_reference_crop_src_height = telemetry.crop_src_height;
+    snapshot_.last_reference_jpeg_width = telemetry.jpeg_width;
+    snapshot_.last_reference_jpeg_height = telemetry.jpeg_height;
+    snapshot_.last_reference_jpeg_quality = telemetry.jpeg_quality;
+    snapshot_.last_reference_head_pixels_width = telemetry.head_pixels_width;
+    snapshot_.last_reference_head_pixels_height = telemetry.head_pixels_height;
+    snapshot_.last_reference_head_pixels_area = telemetry.head_pixels_area;
+    snapshot_.last_reference_jpeg_scale = telemetry.jpeg_scale;
+    snapshot_.last_reference_head_pixel_gain_linear = telemetry.head_pixel_gain_linear;
+    snapshot_.last_reference_head_pixel_gain_area = telemetry.head_pixel_gain_area;
+
+    const auto keepRecent = [](std::vector<uint64_t> *samples, uint64_t value) {
+        samples->push_back(value);
+        if (samples->size() > 64U) samples->erase(samples->begin());
+    };
+    keepRecent(&reference_jpeg_bytes_samples_, static_cast<uint64_t>(jpeg_bytes));
+    keepRecent(&reference_jpeg_quality_samples_, static_cast<uint64_t>(
+        std::max(0, telemetry.jpeg_quality)));
+    keepRecent(&reference_head_pixels_width_samples_, static_cast<uint64_t>(
+        std::max(0, telemetry.head_pixels_width)));
+    keepRecent(&reference_head_pixels_height_samples_, static_cast<uint64_t>(
+        std::max(0, telemetry.head_pixels_height)));
+    keepRecent(&reference_head_pixels_area_samples_, telemetry.head_pixels_area);
+    reference_head_pixel_gain_linear_samples_.push_back(
+        telemetry.head_pixel_gain_linear);
+    reference_head_pixel_gain_area_samples_.push_back(telemetry.head_pixel_gain_area);
+    if (reference_head_pixel_gain_linear_samples_.size() > 64U) {
+        reference_head_pixel_gain_linear_samples_.erase(
+            reference_head_pixel_gain_linear_samples_.begin());
+    }
+    if (reference_head_pixel_gain_area_samples_.size() > 64U) {
+        reference_head_pixel_gain_area_samples_.erase(
+            reference_head_pixel_gain_area_samples_.begin());
+    }
+    snapshot_.reference_jpeg_bytes_p50 = percentile(
+        reference_jpeg_bytes_samples_, 0.50);
+    snapshot_.reference_jpeg_bytes_p95 = percentile(
+        reference_jpeg_bytes_samples_, 0.95);
+    snapshot_.reference_jpeg_quality_p50 = percentile(
+        reference_jpeg_quality_samples_, 0.50);
+    snapshot_.reference_jpeg_quality_p95 = percentile(
+        reference_jpeg_quality_samples_, 0.95);
+    snapshot_.reference_head_pixels_width_p50 = percentile(
+        reference_head_pixels_width_samples_, 0.50);
+    snapshot_.reference_head_pixels_width_p95 = percentile(
+        reference_head_pixels_width_samples_, 0.95);
+    snapshot_.reference_head_pixels_height_p50 = percentile(
+        reference_head_pixels_height_samples_, 0.50);
+    snapshot_.reference_head_pixels_height_p95 = percentile(
+        reference_head_pixels_height_samples_, 0.95);
+    snapshot_.reference_head_pixels_area_p50 = percentile(
+        reference_head_pixels_area_samples_, 0.50);
+    snapshot_.reference_head_pixels_area_p95 = percentile(
+        reference_head_pixels_area_samples_, 0.95);
+    snapshot_.reference_head_pixel_gain_linear_p50 = percentileDouble(
+        reference_head_pixel_gain_linear_samples_, 0.50);
+    snapshot_.reference_head_pixel_gain_linear_p95 = percentileDouble(
+        reference_head_pixel_gain_linear_samples_, 0.95);
+    snapshot_.reference_head_pixel_gain_area_p50 = percentileDouble(
+        reference_head_pixel_gain_area_samples_, 0.50);
+    snapshot_.reference_head_pixel_gain_area_p95 = percentileDouble(
+        reference_head_pixel_gain_area_samples_, 0.95);
+}
+
 bool RebuildSender::beginReference(const Request &request, const ActiveTarget &active,
                                    std::string *error) {
     if (pending_reference_.active) {
@@ -591,7 +850,9 @@ bool RebuildSender::beginReference(const Request &request, const ActiveTarget &a
     RebuildPatchFragment metadata;
     std::vector<uint8_t> blob;
     size_t jpeg_bytes = 0;
-    if (!buildReference(request, active, &metadata, &blob, &jpeg_bytes, error)) return false;
+    ReferenceBuildTelemetry telemetry;
+    if (!buildReference(request, active, &metadata, &blob, &jpeg_bytes,
+                        &telemetry, error)) return false;
     const size_t chunk_bytes = static_cast<size_t>(metadata.chunk_bytes);
     const size_t fragment_count = (blob.size() + chunk_bytes - 1U) / chunk_bytes;
     if (fragment_count == 0 || fragment_count > 255U) {
@@ -619,6 +880,7 @@ bool RebuildSender::beginReference(const Request &request, const ActiveTarget &a
     pending_reference_.chunk_count = fragment_count;
     pending_reference_.fec_bytes = config_.parity && fragment_count > 1U
         ? pending_reference_.parity.size() : 0U;
+    pending_reference_.telemetry = telemetry;
     // Put parity before data.  The receiver can then recover one missing data
     // packet, while an intact transfer completes on its final data packet and
     // cannot be followed by a phantom parity-only incomplete transfer.
@@ -630,12 +892,13 @@ bool RebuildSender::sendPendingReferencePacket(std::string *error) {
     if (!pending_reference_.active) return true;
     RebuildPatchFragment metadata = pending_reference_.metadata;
     uint8_t type = REBUILD_PATCH_DATA;
-    uint16_t flags = 0;
+    uint16_t flags = pending_reference_.telemetry.kind == REFERENCE_KIND_HEAD_PRIORITY
+        ? kRebuildPacketFlagHeadReference : 0U;
     if (!pending_reference_.parity_sent) {
         metadata.fragment_index = metadata.data_fragments;
         metadata.data = pending_reference_.parity;
         type = REBUILD_PATCH_PARITY;
-        flags = 1U;
+        flags = static_cast<uint16_t>(flags | kRebuildPacketFlagParity);
     } else {
         const size_t index = pending_reference_.next_data_index;
         if (index >= metadata.data_fragments) {
@@ -691,7 +954,9 @@ bool RebuildSender::sendPendingReferencePacket(std::string *error) {
                 pending_reference_.first_packet_send_time_us : 0;
     const uint64_t queue_delay_us =
         pending_reference_.first_packet_send_time_us >= pending_reference_.queue_enter_time_us
-            ? pending_reference_.first_packet_send_time_us - pending_reference_.queue_enter_time_us : 0;
+             ? pending_reference_.first_packet_send_time_us - pending_reference_.queue_enter_time_us : 0;
+    recordReferenceTelemetry(pending_reference_.telemetry,
+                             pending_reference_.jpeg_bytes);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++snapshot_.patch_transfers;
@@ -841,6 +1106,16 @@ bool RebuildSender::process(const Request &request, std::string *error) {
         int priority = decision.start ? 1 : 0;
         if (decision.reason == REBUILD_REFRESH_NO_REFERENCE) priority = 3;
         else if (decision.reason == REBUILD_REFRESH_HARD_DEADLINE) priority = 2;
+        // Semantic head priority is only a tie-breaker while the candidate has
+        // hard-deadline slack.  An older vehicle/person reference therefore
+        // remains ahead of a fresh head request when the 450 ms gate is near.
+        const ReferenceCropSelection selection = selectReferenceCrop(
+            request.segmentation.instances[active[index].instance_index],
+            request.frame->source_width, request.frame->source_height, config_);
+        const bool safe_head_bonus = selection.kind == REFERENCE_KIND_HEAD_PRIORITY &&
+            decision.start && decision.capture_age_ms + decision.estimated_delivery_ms <
+                config_.patch_hard_deadline_ms - config_.patch_refresh_guard_ms;
+        if (safe_head_bonus && priority <= 1) ++priority;
         if (!have_decision || priority > selected_priority ||
                 (priority == selected_priority &&
                  decision.capture_age_ms > selected_decision.capture_age_ms)) {

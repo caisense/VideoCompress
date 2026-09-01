@@ -1,0 +1,2839 @@
+/goal
+
+# VideoCompress Face-Aware Bit Allocation
+# 在 100 kbps 硬链路下提升人脸真实有效像素密度和连续清晰度
+
+======================================================================
+0. 总目标
+======================================================================
+
+当前 VideoCompress rebuild 模式已经基本解决：
+
+- reference PTS future/age 基本语义
+- PATCH local-ready
+- reference refresh deadline
+- STATE/video playout synchronization
+- bounded STATE extrapolation
+- geometry translation
+- stable registration template
+- ESRGAN future prefetch
+- same-source-frame immutable
+- SR handover
+
+本任务不要继续围绕这些已实现机制大规模重构。
+
+当前新的主要视觉问题是：
+
+即使 HUD 显示：
+
+    REFREADY=1
+    USED=1/1
+    AGE < 450ms
+    DROP_REASON=NONE
+    MODE=ROI-ESRGAN
+
+人物脸部仍可能长时间明显模糊。
+
+根因假设：
+
+当前发送端为 person 发送的是：
+
+    整个 person bbox
+    + 20% margin
+        ↓
+    最长边 <= 96 px
+        ↓
+    JPEG <= 800 B
+        ↓
+    Real-ESRGAN x2
+
+因此有限的 reference bit 被大量用于：
+
+    身体
+    衣服
+    背景 margin
+    手臂/腿部
+
+真正的人脸可能在 reference JPEG 中只占很少像素。
+
+本任务目标：
+
+在不提高 100 kbps 总链路上限、
+不增加正常 reference 发送次数、
+不放宽 450 ms 时效规则的条件下，
+
+把现有 visual-reference bit
+从“整个人平均分配”
+重新分配为：
+
+    person → head / face-priority sub-ROI
+
+让人物脸部获得显著更高的：
+
+    source pixel density
+    JPEG bit density
+    ESRGAN input quality
+
+同时保持：
+
+    H.265 基础视频连续
+    STATE/PATCH 时序安全
+    100 kbps pacing
+    多目标基本公平
+    非 person 类目标原有行为
+
+
+======================================================================
+1. 本地工作区规则
+======================================================================
+
+当前本地工作区是唯一修改对象。
+
+开始前：
+
+    git status
+    git diff
+
+禁止：
+
+    git pull
+    git fetch
+    git push
+    
+    git reset --hard
+    git checkout -- .
+    git restore .
+    git clean -fd
+
+不得覆盖用户已有未提交修改。
+
+不要读取 goal 后停止。
+
+必须继续：
+
+    检查代码
+    → 建 baseline
+    → 实现
+    → 单元测试
+    → integration test
+    → A/B 验证
+    → debug 统计
+    → git diff --check
+
+除非真实 RK3588 / 摄像头 / CUDA 环境不可用，
+否则不要只做到代码修改。
+
+
+======================================================================
+2. 当前必须保留的硬约束
+======================================================================
+
+以下约束不得通过“优化”取消。
+
+2.1 总链路
+
+    pacing_bitrate_bps = 100000
+
+必须保持。
+
+不能：
+
+    100k → 120k / 150k
+
+来获得更高清 reference。
+
+
+2.2 H.265 rebuild profile
+
+当前：
+
+    256x144
+    6 fps
+    target bitrate ≈ 28 kbps
+
+不要为了 Face ROI：
+
+    降低基础视频 fps
+    关闭 H265
+    大幅挤压 H265 bitrate
+
+
+2.3 Reference hard age
+
+继续：
+
+    content AGE <= 450 ms
+
+不能：
+
+    450 → 700/1000 ms
+
+
+2.4 Future render gate
+
+继续执行当前安全规则。
+
+future reference：
+
+    可以提前 compute
+    不能提前 render
+
+
+2.5 Same-source-frame immutable
+
+同一 source_sequence：
+
+一旦 compose：
+
+    pixels immutable
+
+异步：
+
+    PATCH
+    STATE
+    ESRGAN
+
+只能影响后续 source frame。
+
+
+2.6 SR worker
+
+继续：
+
+    1 running
+    +
+    <= 1 newest pending
+
+禁止无限 SR queue。
+
+
+======================================================================
+3. 第一阶段架构原则：不要增加第二路 reference
+======================================================================
+
+本阶段不要实现：
+
+    Person PATCH
+    +
+    Face PATCH
+
+同时发送。
+
+原因：
+
+当前链路已经接近 100 kbps。
+
+增加第二套 PATCH：
+
+    会增加数据包
+    会增加 FEC
+    会增加 pacer queue
+    可能反过来降低 H265 质量
+    可能导致 reference 延迟重新超过450ms
+
+第一阶段必须采用：
+
+    “同一 reference transfer 内重新分配空间 bit”
+
+也就是：
+
+现有 person reference：
+
+    whole-person crop
+
+替换为：
+
+    head-priority crop
+
+每个 track：
+
+仍然只有：
+
+    一个 active reference generation
+    一套 PATCH transfer
+    同一个 refresh scheduler
+
+正常情况下：
+
+    transfer 数量不得增加。
+
+
+======================================================================
+4. 新增 reference mode
+======================================================================
+
+增加配置：
+
+    --rebuild-reference-mode=person
+    --rebuild-reference-mode=head
+    --rebuild-reference-mode=adaptive
+
+语义：
+
+person：
+
+    完全保持现有整人 reference 行为。
+
+用于 baseline 和 rollback。
+
+
+head：
+
+    对 person class 强制使用 head-priority crop。
+    
+    非 person class 仍使用完整 object crop。
+
+
+adaptive：
+
+    person 满足 head ROI 可靠条件：
+        → HEAD
+    
+    否则：
+        → PERSON
+
+非 person：
+        → PERSON/OBJECT existing behavior
+
+
+为了兼容：
+
+代码初次实现时默认保持：
+
+    person
+
+完成自动测试和 A/B 真机验证后，
+
+若 adaptive 达到本 goal 验收标准，
+
+才把 rebuild profile 默认值改成：
+
+    adaptive
+
+不要在验证前直接改变默认行为。
+
+
+======================================================================
+5. 不新增 face neural model
+======================================================================
+
+本轮不要额外加入：
+
+    RetinaFace
+    SCRFD
+    YOLO-face
+    MediaPipe
+    GFPGAN
+    CompressAI
+
+发送端继续只依赖已经存在的：
+
+    YOLOv8-Seg
+    person bbox
+    person segmentation mask
+
+原因：
+
+Face Detector 会引入：
+
+    新模型
+    RKNN转换
+    NPU调度
+    新模型加载
+    新 latency
+    新部署依赖
+
+本轮先验证一个问题：
+
+“如果把现有800B集中到人物上半部，
+是否已经能够显著提升脸部质量？”
+
+只有本轮验证仍然不足，
+才考虑下一阶段真正 Face Detector。
+
+
+======================================================================
+6. 技术名称
+======================================================================
+
+代码内部不要把 heuristic 结果直接叫：
+
+    FACE_DETECTED
+
+因为当前并没有真的检测到 face。
+
+推荐名称：
+
+    REFERENCE_KIND_FULL
+    REFERENCE_KIND_HEAD_PRIORITY
+
+或者：
+
+    PERSON_REFERENCE_FULL
+    PERSON_REFERENCE_HEAD
+
+文档可以称：
+
+    Face-aware / head-priority bit allocation
+
+但必须明确：
+
+当前 head ROI 是：
+
+    基于 person segmentation 的 face/head proxy
+
+不是：
+
+    face detector 输出。
+
+
+======================================================================
+7. Head ROI 生成算法
+======================================================================
+
+新增纯函数：
+
+例如：
+
+    HeadPriorityCrop selectHeadPriorityCrop(
+        const SegInstance &instance,
+        const Frame &frame,
+        ...)
+
+输入：
+
+    person bbox
+    segmentation mask
+    source width/height
+
+输出结构：
+
+    valid
+    left
+    top
+    right
+    bottom
+    
+    method
+    foreground_ratio
+    width_ratio
+    height_ratio
+    
+    fallback_reason
+
+
+======================================================================
+8. Head ROI 算法第一版
+======================================================================
+
+不要简单写：
+
+    person bbox top 25%
+
+应尽量利用现有 segmentation mask。
+
+建议：
+
+8.1 取得 person detector bbox
+
+    B = [x0, y0, x1, y1]
+    
+    W = x1 - x0
+    H = y1 - y0
+
+
+8.2 首先检查
+
+    W > 0
+    H > 0
+    
+    bbox 与 source 有交集。
+
+
+8.3 在 person bbox 的上部区域寻找 segmentation foreground
+
+搜索范围：
+
+    y0
+    到
+    y0 + 0.55 * H
+
+即人物 bbox 上部约55%。
+
+
+8.4 对 segmentation mask 做行统计
+
+寻找：
+
+    upper foreground
+
+排除纯背景行。
+
+计算：
+
+    foreground top
+    foreground x min/max
+    foreground centroid
+
+
+8.5 生成 head/upper-body proxy
+
+建议初始：
+
+    vertical span ≈ person foreground top
+                    → bbox top + 0.40~0.45H
+
+horizontal：
+
+    根据 upper foreground x min/max
+
+而不是始终：
+
+    bbox center ± fixed width
+
+
+8.6 为了包含：
+
+    头发
+    耳朵
+    下巴
+    肩部
+
+加入少量 margin：
+
+建议初始：
+
+    horizontal margin ≈ 10~15%
+    vertical margin ≈ 8~12%
+
+注意：
+
+这里不是当前 whole-person 的20% margin。
+
+不要浪费大量 background bit。
+
+
+======================================================================
+9. segmentation 不可靠时 fallback
+======================================================================
+
+如果：
+
+    upper mask foreground 太少
+
+或者：
+
+    segmentation mask 不存在
+
+或者：
+
+    upper ROI 非法
+
+不要直接丢 reference。
+
+fallback：
+
+使用 fixed head proxy：
+
+    top = bbox.top
+    
+    bottom ≈ bbox.top + 0.45H
+    
+    width ≈ 0.70~0.80W
+    
+    centered around bbox center
+
+再次 clamp 到 source。
+
+
+如果 fixed proxy 仍不可靠：
+
+    fallback whole-person reference。
+
+
+======================================================================
+10. Head ROI 有效性条件
+======================================================================
+
+至少检查：
+
+    crop_width >= minimum
+    crop_height >= minimum
+
+初始建议：
+
+    >= 24 px
+
+但必须配置化或通过测试确认。
+
+
+如果人物离摄像头过远，
+
+例如：
+
+    proxy 只有 12x15 source pixels
+
+不要声称这是高清 face reference。
+
+记录：
+
+    HEAD_FALLBACK=TOO_SMALL
+
+并使用现有 person crop。
+
+
+另外检查：
+
+    visible_area / expected_area
+
+若因为人物位于图像顶部边缘：
+
+    head crop 被裁掉太多
+
+也 fallback。
+
+
+======================================================================
+11. 坐标语义非常重要
+======================================================================
+
+现有 RB/1 PATCH metadata 已有：
+
+    left
+    top
+    right
+    bottom
+
+和：
+
+    reference_left
+    reference_top
+    reference_right
+    reference_bottom
+
+
+HEAD 模式下：
+
+第一组：
+
+    left/top/right/bottom
+
+必须是：
+
+    实际发送的 head crop
+    在 source image 中的坐标。
+
+
+第二组：
+
+    reference_left/top/right/bottom
+
+继续保存：
+
+    完整 person detector bbox
+    at reference capture time。
+
+
+不要把第二组也改成 head bbox。
+
+因为 receiver 需要：
+
+    reference full-person detector bbox
+        →
+    current full-person target bbox
+
+计算：
+
+    translation
+    scale
+
+然后把内部 head crop 映射到：
+
+    当前人物头部位置。
+
+
+这是本轮避免协议大改的关键。
+
+
+======================================================================
+12. 不升级 RB/1 header size
+======================================================================
+
+第一阶段不要：
+
+    kRebuildPatchFragmentHeaderBytes 40 → 新尺寸
+
+不要因为 head reference：
+
+增加新的坐标字段。
+
+现有 metadata 已经足够表达：
+
+    sub-crop
+    +
+    parent detector bbox
+
+
+如果需要 debug REFKIND，
+
+优先使用：
+
+    RebuildPacket.flags
+
+中的一个未使用 bit。
+
+当前 parity 已使用：
+
+    bit0
+
+因此如果确认没有冲突，
+
+可以定义：
+
+    REBUILD_PACKET_FLAG_PARITY      = 0x0001
+    REBUILD_PACKET_FLAG_HEAD_REF    = 0x0002
+
+PATCH DATA HEAD：
+
+    flags |= HEAD_REF
+
+PATCH PARITY HEAD：
+
+    flags |= PARITY
+    flags |= HEAD_REF
+
+
+要求：
+
+旧 receiver 不认识 HEAD_REF 时：
+
+仍然能够把 packet 当普通 reference 使用。
+
+不要修改 protocol version。
+
+
+如果 flags 会引入不必要复杂度，
+也允许第一阶段只通过 telemetry 标记 REFKIND，
+功能逻辑不能依赖该 flag。
+
+
+======================================================================
+13. JPEG bit allocation
+======================================================================
+
+目标不是：
+
+“增加800B”
+
+而是：
+
+“让相同800B主要描述脸/头肩”。
+
+
+现有：
+
+    patch_max_bytes = 800
+    patch_max_side = 96
+
+第一轮继续保留：
+
+    head max bytes <= 800
+    head max side <= 96
+
+
+绝对不要：
+
+    head_max_bytes=1600
+
+作为默认修复。
+
+
+======================================================================
+14. HEAD JPEG 初始质量
+======================================================================
+
+由于 head crop 内容远少于 whole person，
+
+可以尝试提高初始 JPEG quality。
+
+新增：
+
+    --rebuild-head-jpeg-quality
+
+初始建议：
+
+    60
+
+以及：
+
+    --rebuild-head-min-jpeg-quality
+
+初始建议：
+
+    45
+
+
+仍要求：
+
+    encoded JPEG <= patch_max_bytes
+
+
+编码过程建议抽成：
+
+    encodeReferenceJpeg(...)
+
+输入：
+
+    crop
+    max_side
+    initial_quality
+    min_quality
+    max_bytes
+
+
+FULL：
+
+继续保持现有：
+
+    Q50
+    min Q40
+    800B
+
+
+HEAD：
+
+A/B 初始：
+
+    Q60
+    min Q45
+    800B
+
+
+======================================================================
+15. JPEG 降级算法必须记录最终结果
+======================================================================
+
+不能只知道配置：
+
+    Q60
+
+必须知道实际最终：
+
+    Q60
+    Q53
+    Q46
+    resized...
+
+记录：
+
+    initial quality
+    final quality
+    
+    original crop W/H
+    encoded JPEG W/H
+    
+    resize scale
+    
+    JPEG bytes
+
+
+新增 telemetry：
+
+    REF_KIND
+    CROP_SRC_W/H
+    JPEG_W/H
+    JPEG_Q
+    JPEG_BYTES
+    JPEG_SCALE
+
+
+======================================================================
+16. 关键新指标：人脸/头部有效像素密度
+======================================================================
+
+这是本任务最重要的验证指标之一。
+
+必须计算：
+
+baseline FULL reference 中，
+
+相同 head-proxy 区域在最终 JPEG 里占：
+
+    estimated_head_jpeg_width
+    estimated_head_jpeg_height
+
+
+例如：
+
+FULL：
+
+    JPEG = 50x96
+    head area projected = 18x22
+
+
+HEAD：
+
+    JPEG = 78x96
+    head effective area = 70x80
+
+
+记录：
+
+    HEADPX_W
+    HEADPX_H
+    HEADPX_AREA
+
+
+定义：
+
+    HEAD_PIXEL_GAIN_LINEAR
+
+和：
+
+    HEAD_PIXEL_GAIN_AREA
+
+
+A/B 验收至少报告：
+
+    median
+    p10
+    p50
+    p90
+
+
+目标：
+
+adaptive/head 模式的：
+
+    median head linear resolution
+
+相对 person baseline：
+
+    至少提升约 1.8x
+
+优选：
+
+    >= 2x
+
+
+面积像素密度目标：
+
+    >= 3x
+
+如果实际数据无法达到，
+必须解释原因。
+
+
+======================================================================
+17. 不增加 refresh cadence
+======================================================================
+
+本轮不要通过：
+
+    refresh 334ms
+        ↓
+    refresh 167ms
+
+提高人脸质量。
+
+Reference cadence 继续由现有：
+
+    capture-time deadline scheduler
+
+控制。
+
+
+HEAD reference：
+
+    使用同一个 reference generation
+    使用同一个 refresh scheduler
+
+不能：
+
+    person 每334ms
+    head每167ms
+
+因为这会破坏100kbps预算。
+
+
+======================================================================
+18. 多目标情况下的 face priority
+======================================================================
+
+当前 max_targets 可能 >1。
+
+如果：
+
+    person
+    vehicle
+
+同时等待 reference，
+
+可以引入 face-aware priority，
+
+但 hard deadline 必须优先于语义等级。
+
+
+推荐 scheduler：
+
+第一层：
+
+    earliest hard deadline / smallest slack
+
+如果某 track 已接近：
+
+    450ms deadline
+
+不得因为它不是 person 而饿死。
+
+
+只有当多个 candidate：
+
+    deadline slack 都安全
+
+才优先：
+
+    HEAD_PRIORITY person
+
+
+可以实现：
+
+    effective_score =
+        deadline urgency
+        +
+        small semantic bonus
+
+
+禁止：
+
+person 永远占用 reference channel，
+
+导致：
+
+vehicle reference AGE >450。
+
+
+======================================================================
+19. 第一阶段不发送 whole-person context patch
+======================================================================
+
+人物 BODY 继续依赖：
+
+    H.265 256x144 base
+
+HEAD reference 只负责：
+
+    high-information upper region
+
+这正是 bit reallocation 的核心。
+
+
+不要因为：
+
+“脸变清楚但衣服没有以前锐”
+
+又增加一个：
+
+    body JPEG
+
+除非后续 A/B 证明业务必须。
+
+
+======================================================================
+20. Receiver 第一阶段原则
+======================================================================
+
+Receiver 不需要建立新的第二层 reference generation。
+
+仍然：
+
+    one track
+    one reference_generation
+
+
+区别只是：
+
+reference.image
+
+现在可能代表：
+
+    full person crop
+
+或者：
+
+    head sub-crop。
+
+
+现有：
+
+    crop rect
+    reference detector bbox
+
+应该足以映射。
+
+
+======================================================================
+21. Receiver 必须增加 HEAD crop regression test
+======================================================================
+
+构造：
+
+reference detector bbox：
+
+    [100, 50, 300, 450]
+
+HEAD crop：
+
+    [140, 50, 260, 210]
+
+
+current target bbox：
+
+    [150, 70, 390, 550]
+
+
+检查：
+
+_registered_crop / registration details
+
+必须把 HEAD crop：
+
+正确 translation + scale
+
+到：
+
+当前人物对应上部位置。
+
+
+不能：
+
+把 HEAD crop 拉伸成整个人大小。
+
+
+这是非常重要的测试。
+
+
+======================================================================
+22. 禁止将 HEAD PATCH 拉伸到完整 target bbox
+======================================================================
+
+仔细检查：
+
+    _registered_crop()
+    _registration_details()
+    _assets()
+    _blend()
+
+确保最终：
+
+patch size
+
+来自：
+
+    transformed crop rect
+
+不是：
+
+    current whole person bbox size。
+
+
+如果当前实现已经正确：
+
+只补测试。
+
+不要无意义重构。
+
+
+======================================================================
+23. Mask 必须跟随 head crop
+======================================================================
+
+发送端 mask：
+
+必须对应实际 HEAD crop。
+
+不能：
+
+JPEG = head crop
+
+但：
+
+mask = whole-person crop mask
+
+
+必须：
+
+从 segmentation mask 中裁出相同 source rect
+
+然后：
+
+encode mask
+
+
+receiver：
+
+JPEG dimension
+mask dimension
+crop rect
+
+三者必须一致。
+
+
+======================================================================
+24. Head mask 必须允许头发/肩部
+======================================================================
+
+不要使用过强 erosion：
+
+导致：
+
+脸边缘
+头发
+耳朵
+
+被 mask 掉。
+
+
+本轮先沿用当前 segmentation mask pipeline。
+
+如果发现头部 mask 过窄，
+
+只允许针对 HEAD reference：
+
+做小量：
+
+    dilation / feather
+
+必须配置化。
+
+禁止把 rectangular background 全贴上去。
+
+
+======================================================================
+25. 边缘融合
+======================================================================
+
+HEAD reference 比 full-person crop 更局部，
+
+因此接缝更容易被看见。
+
+检查现有 alpha/mask blending。
+
+
+要求：
+
+头肩边缘不能出现明显：
+
+    方框
+    硬边
+    halo
+
+
+如果需要，
+
+增加：
+
+    mask feather radius
+
+但不要改动 reference 的身份/PTS逻辑。
+
+
+======================================================================
+26. Real-ESRGAN 不换模型
+======================================================================
+
+继续使用当前：
+
+    RealESRGAN_x2_dynamic.onnx
+
+本轮不要：
+
+    x2 → x4
+    ESRGAN → GFPGAN
+
+
+目标先验证：
+
+“给 ESRGAN 更好的真实输入”
+
+能否解决问题。
+
+
+如果 HEAD reference 输入像素已经显著增加，
+
+但 SR 结果仍明显模糊，
+
+最终报告中再建议下一阶段模型升级。
+
+
+======================================================================
+27. 新增 debug 保存模式
+======================================================================
+
+增加：
+
+    --rebuild-debug-reference-dir=<dir>
+
+关闭时：
+
+    不能产生磁盘I/O。
+
+
+开启时保存有限量样本：
+
+    raw source crop
+    encoded reference JPEG
+    decoded reference
+    SR native output
+    final rendered ROI
+
+按：
+
+    track
+    reference generation
+    kind
+
+命名。
+
+
+例如：
+
+    track1_gen23_HEAD_source.png
+    track1_gen23_HEAD_jpeg.jpg
+    track1_gen23_HEAD_sr.png
+
+
+必须有：
+
+    max sample count
+
+例如默认100。
+
+避免磁盘无限增长。
+
+
+======================================================================
+28. Debug HUD 增加
+======================================================================
+
+建议新增：
+
+    REFKIND HEAD
+    
+    CROP 112x170
+    JPEG 63x96 Q60 721B
+    
+    HEADPX 55x72
+    
+    SRNATIVE 126x192
+    
+    PASTE 118x154
+
+
+不要让 HUD 过长到完全遮住图像。
+
+可以压缩成：
+
+    REF HEAD C112x170 J63x96 Q60 721B H55x72
+
+
+如果为 FULL：
+
+    REF FULL ...
+
+
+======================================================================
+29. Sender snapshot telemetry
+======================================================================
+
+增加累计：
+
+    full_reference_transfers
+    head_reference_transfers
+    head_fallback_transfers
+
+fallback 原因：
+
+    SMALL
+    MASK
+    EDGE
+    INVALID
+
+
+以及：
+
+    head_jpeg_bytes
+    full_jpeg_bytes
+    
+    head_pixel_gain samples
+
+
+输出：
+
+    p50
+    p95
+
+如果现有 snapshot 不适合放太多数组，
+
+至少维护：
+
+    last
+    count
+    rolling average/p50/p95
+
+
+======================================================================
+30. Baseline 自动化分析
+======================================================================
+
+在修改功能前，
+
+使用当前 person 模式采集 baseline。
+
+
+工具：
+
+    tools/analyze_face_reference.py
+
+或扩展：
+
+    analyze_rebuild_debug.py
+
+
+至少统计：
+
+    total references
+    JPEG bytes p50/p95
+    final JPEG quality distribution
+    JPEG W/H distribution
+    crop source W/H
+    estimated HEADPX W/H
+    reference delivery p50/p95
+    RB wire bitrate
+    H265 bitrate
+
+以及：
+
+    MODE counts
+    AGE DROP
+    STATE DROP
+    CONTENT DROP
+    SR hit
+    SR latency
+
+
+保存 baseline 报告。
+
+
+======================================================================
+31. Offline deterministic test
+======================================================================
+
+如果项目里有：
+
+    input video
+    saved frame
+    deterministic segmentation fixture
+
+优先实现离线测试。
+
+
+对于同一 source frame + person segmentation：
+
+分别生成：
+
+    PERSON reference
+    HEAD reference
+
+
+输出：
+
+    crop source dims
+    JPEG dims
+    JPEG Q
+    bytes
+    effective head pixels
+
+
+测试必须证明：
+
+    HEAD bytes <= FULL max-byte cap
+
+且：
+
+    head effective pixels > full effective pixels
+
+
+不要用不同源帧做这项比较。
+
+
+======================================================================
+32. JPEG cap test
+======================================================================
+
+构造高纹理人物：
+
+    头发
+    格子衣服
+    背景复杂
+
+
+HEAD reference 必须始终：
+
+    jpeg_bytes <= 800
+
+
+若无法满足：
+
+编码器必须继续：
+
+    quality/scale fallback
+
+不得：
+
+    超过协议配置
+    抛出无限重试
+
+
+======================================================================
+33. Tiny-person fallback test
+======================================================================
+
+构造：
+
+person bbox 很小。
+
+例如：
+
+    35x60
+
+
+HEAD candidate：
+
+预计过小。
+
+要求：
+
+    mode=adaptive
+        ↓
+    FALLBACK FULL
+
+
+并记录：
+
+    HEAD_FALLBACK=SMALL
+
+
+不能发送一个：
+
+    10x12
+
+然后让 ESRGAN 猜整张脸。
+
+
+======================================================================
+34. Edge-person test
+======================================================================
+
+人物头部靠：
+
+    top edge
+    left edge
+    right edge
+
+
+HEAD crop clamp 后：
+
+必须合法。
+
+
+如果有效区域仍足够：
+
+    HEAD
+
+如果裁切比例过大：
+
+    FULL fallback
+
+
+不得：
+
+负坐标
+越界
+空 JPEG
+mask mismatch。
+
+
+======================================================================
+35. Seated / partial person test
+======================================================================
+
+构造：
+
+person bbox 只包含：
+
+    上半身
+
+或者：
+
+    坐着的人
+
+
+head selector 不能依赖：
+
+“person 一定是完整站立人体”。
+
+利用 segmentation upper foreground。
+
+验证 head ROI 仍覆盖：
+
+    face/head/shoulder area。
+
+
+======================================================================
+36. Non-person regression
+======================================================================
+
+例如：
+
+    car
+    bicycle
+    object
+
+
+mode=adaptive：
+
+不得被错误裁成：
+
+    top 45%
+
+
+非 person 类：
+
+使用原有 reference crop。
+
+要求：
+
+bit-exact 或行为等价于原逻辑，
+除非此次重构 JPEG helper 造成可解释差异。
+
+
+======================================================================
+37. Protocol regression
+======================================================================
+
+现有：
+
+    STATE serialize/parse
+    PATCH serialize/parse
+    FEC
+    CRC
+    reorder
+
+测试必须继续通过。
+
+
+如果新增 HEAD packet flag：
+
+新增测试：
+
+    DATA HEAD
+    PARITY HEAD
+
+确保：
+
+    parity bit
+    head bit
+
+可以组合。
+
+
+并验证旧逻辑：
+
+    unknown flag ignored
+
+不影响：
+
+    JPEG
+    mask
+    CRC
+    FEC。
+
+
+======================================================================
+38. Reference-generation 生命周期不变
+======================================================================
+
+HEAD reference：
+
+不能建立额外的：
+
+    face_reference_generation
+
+
+第一阶段继续：
+
+    track.reference_generation
+
+
+STATE：
+
+    reference_generation
+
+继续表示：
+
+当前唯一 visual reference generation。
+
+
+避免引入：
+
+    person gen
+    face gen
+
+双生命周期问题。
+
+
+======================================================================
+39. 100 kbps 硬预算验证
+======================================================================
+
+这是本任务硬性验收。
+
+Baseline 和 adaptive：
+
+使用完全相同：
+
+    H265 profile
+    fps
+    link cap
+    audio setting
+    camera scene
+
+
+分别运行：
+
+    >= 60 seconds
+
+
+统计 rolling 1s：
+
+    H265 wire
+    RB wire
+    audio wire
+    V+RB(+audio) total
+
+
+要求：
+
+    global pacer 仍为100000
+
+不存在持续突破100kbps。
+
+
+如果 HUD WIRE 指标包含链路开销：
+
+记录其具体定义。
+
+
+目标：
+
+adaptive RB wire：
+
+    <= baseline + 5%
+
+优选：
+
+    <= baseline
+
+
+若 adaptive 明显增加 wire：
+
+任务不能标记成功，
+必须定位原因。
+
+
+======================================================================
+40. 不允许 H265 被 side-channel 饿死
+======================================================================
+
+比较：
+
+baseline vs adaptive：
+
+    H265 kbps
+    P-frame recovery
+    last IDR
+    queue delay
+    packet latency
+    decode fps
+
+
+验收：
+
+H265 稳态码率不应因为 head reference：
+
+下降超过 baseline 约10%
+
+并且：
+
+不得新增明显卡顿。
+
+
+如果 head reference 小很多，
+
+理论上应反而释放部分 RB budget。
+
+
+======================================================================
+41. Reference delivery 时效
+======================================================================
+
+比较：
+
+    capture_to_send p50/p95
+    delivery p50/p95
+    queue delay p50/p95
+
+
+adaptive 不得显著恶化。
+
+
+重点：
+
+    AGE>450 DROP
+
+不能因为新 JPEG policy：
+
+显著增加。
+
+
+目标：
+
+    AGEDROP rate <= baseline
+
+优选：
+
+    更低。
+
+
+======================================================================
+42. SR 时序指标
+======================================================================
+
+由于 HEAD crop JPEG可能更小，
+
+PATCH可能更早完成。
+
+
+统计：
+
+    SR submit
+    SR done
+    SR latency
+    SR hit
+    SR stale
+    new-RGEN first-frame hit
+
+
+adaptive 不得导致：
+
+    SR STALE 大幅上升。
+
+
+Real-ESRGAN 输入尺寸变化后，
+
+记录真实：
+
+    p50 / p95。
+
+
+======================================================================
+43. 视觉 GT 验证
+======================================================================
+
+如果可从 sender full-resolution RGB
+保存原始人物区域，
+
+把它作为：
+
+    source ground truth
+
+
+对于 debug 样本：
+
+保存：
+
+    source head crop
+
+和 receiver：
+
+    final reconstructed head crop
+
+
+映射到统一尺寸。
+
+
+计算至少：
+
+    PSNR
+
+如已有依赖：
+
+    SSIM
+
+
+可选：
+
+    LPIPS
+
+但不要为了LPIPS引入大型新PyTorch依赖。
+
+
+注意：
+
+Real-ESRGAN属于感知增强，
+
+因此不能只用PSNR判断。
+
+最终同时报告：
+
+    objective metric
+    +
+    side-by-side visual samples。
+
+
+======================================================================
+44. Sharpness 指标只能作为辅助
+======================================================================
+
+可以计算：
+
+    Laplacian variance
+    edge energy
+
+
+但不能把：
+
+“锐化噪声增加”
+
+错误判为：
+
+真实细节提升。
+
+
+因此 sharpness 只能辅助。
+
+核心必须结合：
+
+    source GT
+    reference pixel density
+    JPEG quality
+    visual comparison。
+
+
+======================================================================
+45. 关键视觉 A/B
+======================================================================
+
+选同一个稳定人物场景：
+
+    正脸
+    轻微转头
+    小幅移动
+    远近变化
+
+
+A：
+
+    --rebuild-reference-mode=person
+
+
+B：
+
+    --rebuild-reference-mode=adaptive
+
+
+其他参数全部一致。
+
+
+各保存：
+
+    >= 60s output video
+    debug log
+    reference samples
+
+
+最终生成：
+
+    face-aware_ab_report.md
+
+
+======================================================================
+46. A/B 报告必须有表格
+======================================================================
+
+至少：
+
+Metric                     PERSON       ADAPTIVE
+------------------------------------------------
+Total wire kbps
+H265 kbps
+RB kbps
+
+Reference transfers/s
+JPEG bytes p50/p95
+JPEG Q p50/p95
+
+Head pixels width p50
+Head pixels height p50
+Head pixel area p50
+
+Reference delivery p95
+AGE drop rate
+
+STATE drop rate
+CONTENT drop rate
+
+ROI-ESRGAN %
+ROI-LANCZOS %
+BASE %
+
+SR hit %
+SR latency p50/p95
+SR stale
+
+Face/Head PSNR
+Face/Head SSIM(if available)
+
+Temporal mode transitions
+
+
+======================================================================
+47. 最关键验收标准
+======================================================================
+
+本任务必须同时满足：
+
+A. 带宽
+
+    总链路 cap 仍为100kbps
+    
+    adaptive 不得靠增加总流量取胜。
+
+
+B. Face input density
+
+    head effective pixel density
+    相对 FULL baseline
+    
+    中位线性分辨率 >= 1.8x
+    
+    优选 >=2x
+
+
+C. Face visual quality
+
+人工对比中：
+
+    眼睛
+    鼻子
+    嘴部
+    发际线
+
+明显比 person baseline：
+
+    更稳定
+    更可辨认
+
+
+D. Temporal stability
+
+不能因为 HEAD：
+
+引入新的：
+
+    sharp / blur flashing
+    
+    ROI / BASE flashing
+
+
+E. H265
+
+基础视频连续性不得明显下降。
+
+
+======================================================================
+48. 失败判定
+======================================================================
+
+如果出现以下任一情况，
+
+不能把任务标记“完成”：
+
+1.
+
+    adaptive V+RB 持续超过100kbps
+
+
+2.
+
+    H265明显被PATCH挤压
+
+
+3.
+
+    AGE DROP显著增加
+
+
+4.
+
+    人脸有效像素没有明显增加
+
+
+5.
+
+    HEAD crop经常错到：
+    
+        胸口
+        背景
+        头外区域
+
+
+6.
+
+    视觉质量提升主要来自：
+    
+        过度锐化
+        ESRGAN hallucination
+
+而真实结构没有改善。
+
+
+======================================================================
+49. HEAD selector 可视化验证
+======================================================================
+
+增加 debug：
+
+    --rebuild-debug-head-roi=1
+
+
+在 sender preview 或保存图片中画：
+
+    person bbox：一种线型
+    selected head ROI：另一种线型
+
+
+至少人工检查：
+
+    100 个 person samples
+
+
+分类：
+
+    GOOD
+    TOO_HIGH
+    TOO_LOW
+    TOO_WIDE
+    TOO_NARROW
+    MISSED
+
+
+目标：
+
+明显错误率必须很低。
+
+
+如果 heuristic 错误率过高，
+
+不要继续用更复杂的 JPEG 参数掩盖问题。
+
+先修 selector。
+
+
+======================================================================
+50. 可配置参数
+======================================================================
+
+根据实际代码风格增加必要选项。
+
+建议：
+
+    --rebuild-reference-mode=
+    
+    --rebuild-head-class-id=0
+    
+    --rebuild-head-height-ratio=0.45
+    
+    --rebuild-head-width-ratio=0.75
+    
+    --rebuild-head-margin-percent=12
+    
+    --rebuild-head-min-size=24
+    
+    --rebuild-head-jpeg-quality=60
+    
+    --rebuild-head-min-jpeg-quality=45
+
+
+不要加入几十个无意义参数。
+
+如果算法能够从 segmentation 自适应，
+
+ratio 只用于 fallback。
+
+
+======================================================================
+51. 参数验证
+======================================================================
+
+parseAppConfig 必须检查：
+
+    ratio合法
+    quality 1~100
+    min_quality <= quality
+    min_size >0
+    class_id合法
+
+
+错误配置：
+
+启动时明确报错。
+
+
+======================================================================
+52. 默认参数切换规则
+======================================================================
+
+实现初期：
+
+    default reference-mode=person
+
+
+自动测试全部通过后：
+
+执行真实 A/B。
+
+
+只有满足第47节验收，
+
+才能将 REBUILD profile 默认改成：
+
+    adaptive
+
+
+否则：
+
+保持 person 默认
+
+并在结果报告说明原因。
+
+
+======================================================================
+53. Phase 2：只有 Phase 1 不够时才考虑双层 reference
+======================================================================
+
+不要默认实施本节。
+
+
+只有当结果：
+
+HEAD模式明显改善face，
+
+但：
+
+body/detail业务需求无法接受
+
+并且实测存在稳定带宽余量，
+
+才设计：
+
+    low-frequency PERSON context
+    +
+    high-priority HEAD reference
+
+
+如果进入 Phase 2：
+
+必须先写设计说明，
+
+不要直接编码。
+
+
+需要重新设计：
+
+    independent reference identity
+    scheduler
+    STATE advertisement
+    protocol compatibility
+    receiver composition order
+
+
+这超出当前第一阶段范围。
+
+
+======================================================================
+54. Phase 3：真正 Face Detector 也是后续项
+======================================================================
+
+只有当：
+
+head segmentation proxy
+
+经验证定位不稳定，
+
+再评估：
+
+轻量 face detector。
+
+
+必须比较：
+
+    NPU latency
+    model memory
+    RKNN compatibility
+    overall pipeline fps
+
+
+不要在本次任务偷偷加入。
+
+
+======================================================================
+55. 建议主要修改文件
+======================================================================
+
+预计：
+
+cpp/common/config.h
+cpp/common/config.cc
+
+cpp/transport/rebuild_sender.h
+cpp/transport/rebuild_sender.cc
+
+必要时：
+
+cpp/transport/rebuild_protocol.h
+cpp/transport/rebuild_protocol.cc
+
+如果使用 packet HEAD flag：
+
+tools/rebuild_protocol.py
+
+tools/rebuild_receiver.py
+
+tools/live_h265_hud.py
+
+tools/test_rebuild_protocol.py
+tools/test_live_h265_hud.py
+
+新增或扩展：
+
+tools/analyze_face_reference.py
+
+文档：
+
+启动.md
+协议.md
+
+以及现有 fix / goal 文档。
+
+
+======================================================================
+56. 推荐内部代码结构
+======================================================================
+
+不要把 buildReference() 继续扩大成一个超长函数。
+
+建议抽取：
+
+ReferenceCropSelection
+
+字段：
+
+    kind
+    crop
+    parent_bbox
+    valid
+    fallback_reason
+    foreground_ratio
+
+
+函数：
+
+    selectFullReferenceCrop()
+    
+    selectHeadPriorityCrop()
+    
+    selectReferenceCrop()
+
+
+再抽：
+
+ReferenceEncodeResult
+
+字段：
+
+    jpeg
+    width
+    height
+    quality
+    scale
+    bytes
+
+
+函数：
+
+    encodeReferenceJpeg()
+
+
+这样可以独立单元测试。
+
+
+======================================================================
+57. 现有行为兼容测试
+======================================================================
+
+当：
+
+    --rebuild-reference-mode=person
+
+要求尽量保持：
+
+401c9bc 原来的 reference crop 逻辑。
+
+特别：
+
+    crop margin
+    JPEG max side
+    JPEG cap
+    generation
+    FEC
+    scheduler
+
+不能因为重构 helper
+无意改变 baseline。
+
+
+======================================================================
+58. 编译与测试
+======================================================================
+
+至少执行当前项目已有：
+
+Python protocol tests
+HUD tests
+receiver/composer tests
+C++ tests
+
+并增加本任务测试。
+
+
+必须实际记录：
+
+    command
+    test count
+    PASS/FAIL
+
+
+不能只写：
+
+    “tests should pass”。
+
+
+======================================================================
+59. 静态检查
+======================================================================
+
+执行：
+
+    git diff --check
+
+
+如果项目已有：
+
+    clang-format check
+    cmake build
+    compiler warnings
+
+也运行。
+
+
+不要大范围格式化无关代码。
+
+
+======================================================================
+60. RK3588 真机验证
+======================================================================
+
+如果板卡可用：
+
+必须实际编译部署。
+
+
+运行 A/B：
+
+PERSON：
+
+    reference-mode=person
+
+ADAPTIVE：
+
+    reference-mode=adaptive
+
+
+其他参数完全一致。
+
+
+每组：
+
+    >=60 seconds
+
+
+场景至少：
+
+1. 人静止正脸
+2. 人轻微走动
+3. 转头
+4. 靠近摄像头
+5. 远离摄像头
+
+
+如果只有一个场景可执行，
+
+明确写明限制。
+
+
+======================================================================
+61. PC Real-ESRGAN 验证
+======================================================================
+
+必须使用真实：
+
+    CUDAExecutionProvider
+    RealESRGAN_x2_dynamic.onnx
+
+
+不能只用 fake resolver
+作为视觉质量结论。
+
+
+记录：
+
+    model warmup
+    p50
+    p95
+    SR hit
+    stale
+
+
+======================================================================
+62. Debug 视频观察重点
+======================================================================
+
+观察不能只看 HUD 是否：
+
+    ROI-ESRGAN
+
+
+真正检查：
+
+A.
+
+人脸在连续至少：
+
+    3~5 seconds
+
+内是否稳定。
+
+
+B.
+
+是否仍存在：
+
+    清楚
+    ↓
+    模糊
+    ↓
+    清楚
+
+
+C.
+
+人转头时：
+
+是否把旧正脸过度贴到新姿态。
+
+
+如果出现：
+
+明显 ghost face
+
+宁可：
+
+    fallback
+
+也不要追求始终ROI。
+
+
+======================================================================
+63. 真实性安全原则
+======================================================================
+
+本项目的 Face-aware 目标是：
+
+把更多真实 source pixels
+传给 PC。
+
+不是：
+
+通过生成模型虚构身份细节。
+
+
+因此优化优先级：
+
+真实 source face information
+>
+JPEG fidelity
+>
+temporal consistency
+>
+perceptual sharpening
+
+
+不要通过：
+
+    极强锐化
+    face hallucination model
+
+让指标看起来更好。
+
+
+======================================================================
+64. 最终输出
+======================================================================
+
+任务结束必须按照：
+
+# Result
+
+
+## 1. Baseline
+
+说明401c9bc原始：
+
+FULL person reference
+
+在真实场景中的：
+
+    crop
+    JPEG
+    head effective pixels
+    bitrate
+    visual quality
+
+
+## 2. Root Cause Validation
+
+证明或否定：
+
+整人96px/800B
+导致face input不足。
+
+
+必须用数据，
+
+不能只重复 goal。
+
+
+## 3. Head Selector
+
+说明：
+
+mask算法
+fallback
+错误样本。
+
+
+## 4. Bit Allocation
+
+说明：
+
+FULL和HEAD：
+
+同一800B预算下
+实际如何重新分配。
+
+
+## 5. Protocol
+
+是否：
+
+完全未修改wire layout
+
+如果用了flags：
+
+说明bit定义和backward compatibility。
+
+
+## 6. Receiver
+
+说明：
+
+head crop如何通过：
+
+parent detector bbox
+
+映射到current target。
+
+
+## 7. Tests
+
+逐项命令：
+
+    PASS / FAIL
+
+
+## 8. A/B Metrics
+
+给出第46节完整表格。
+
+
+## 9. Visual Result
+
+指出：
+
+脸部哪些方面改善
+
+哪些仍不足。
+
+
+## 10. 100 kbps Verification
+
+明确：
+
+总wire
+H265
+RB
+audio
+
+是否满足。
+
+
+## 11. RK3588
+
+真实运行结果
+
+或明确：
+
+本环境无法执行。
+
+
+## 12. CUDA ESRGAN
+
+真实结果
+
+或明确未执行。
+
+
+## 13. Remaining Problems
+
+例如：
+
+    person太远
+    side pose
+    occlusion
+    segmentation错误
+    face/head proxy不准
+    ESRGAN hallucination
+    multi-target contention
+
+
+## 14. Recommended Defaults
+
+根据 A/B：
+
+决定：
+
+    person
+还是
+    adaptive
+
+作为最终默认。
+
+
+## 15. Next Stage
+
+只有数据支持时，
+
+才能建议：
+
+    face detector
+    dual-layer references
+    GFPGAN
+    CompressAI
+
+
+## 16. Git Status
+
+输出：
+
+    git status
+    git diff --check
+
+明确：
+
+    未pull
+    未fetch
+    未push
+    未覆盖用户未提交修改
+
+
+======================================================================
+65. 最终成功定义
+======================================================================
+
+本任务真正成功不是：
+
+    HUD显示ROI-ESRGAN
+
+而是：
+
+在与原401c9bc相同100kbps链路条件下，
+
+通过：
+
+    FULL PERSON
+        ↓
+    HEAD-PRIORITY REFERENCE
+
+把现有 side-channel bit
+重新集中到人物最有价值的脸/头肩区域，
+
+使：
+
+    ESRGAN输入的人脸真实像素显著增加
+
+同时：
+
+    总带宽不增加
+    H265不恶化
+    reference不更容易过期
+    STATE/CONTENT drop不恶化
+    时间连续性不恶化
+
+最终实际画面中的人脸：
+
+    更清楚
+    更稳定
+    更少长时间模糊
+
+且该改善必须能够通过：
+
+    reference pixel density
+    JPEG telemetry
+    100kbps wire统计
+    A/B视频
+    objective metrics
+
+共同验证，
+而不是依靠主观描述。
