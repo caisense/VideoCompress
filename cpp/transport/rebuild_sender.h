@@ -27,6 +27,15 @@ struct RebuildSenderSnapshot {
     uint64_t submitted_requests;
     uint64_t replaced_requests;
     uint64_t state_packets;
+    // STATE timing stays on FrameMeta's steady-clock domain so it can be
+    // compared directly with the video sender's tx_send_e2e_us telemetry.
+    uint64_t last_state_capture_time_us;
+    uint64_t last_state_send_start_time_us;
+    uint64_t last_state_send_time_us;
+    uint64_t last_state_pacer_delay_us;
+    uint64_t last_state_capture_to_send_us;
+    uint64_t state_capture_to_send_p50_us;
+    uint64_t state_capture_to_send_p95_us;
     uint64_t patch_transfers;
     uint64_t patch_packets;
     uint64_t parity_packets;
@@ -187,6 +196,7 @@ private:
     PendingReference pending_reference_;
     RebuildSenderSnapshot snapshot_;
     std::vector<uint64_t> reference_capture_to_send_samples_us_;
+    std::vector<uint64_t> state_capture_to_send_samples_us_;
     std::vector<uint64_t> reference_delivery_samples_us_;
     std::vector<uint64_t> reference_interval_samples_us_;
     std::map<uint16_t, uint64_t> previous_reference_capture_times_us_;

@@ -726,7 +726,11 @@ int main(int argc, char **argv) {
                         "audio_noise_dbfs=%.1f audio_agc_db=%.1f audio_speech_snr_db=%.1f "
                         "audio_voicing=%.0f audio_gate=%d audio_voice=%d audio_dtx=%d "
                         "audio_dtx_drop=%llu audio_dtx_hold=%llu audio_dtx_speech=%llu "
-                        "audio_dtx_keepalive=%llu rebuild_state=%llu rebuild_refs=%llu "
+                        "audio_dtx_keepalive=%llu rebuild_state=%llu "
+                        "rebuild_state_capture_us=%llu rebuild_state_send_start_us=%llu "
+                        "rebuild_state_send_us=%llu rebuild_state_pacer_us=%llu "
+                        "rebuild_state_capture_send_us=%llu rebuild_state_capture_p50_us=%llu "
+                        "rebuild_state_capture_p95_us=%llu rebuild_refs=%llu "
                         "rebuild_patch_packets=%llu rebuild_parity=%llu rebuild_jpeg_bytes=%llu "
                         "rebuild_wire_bytes=%llu rebuild_q=%zu rebuild_refgen=%u "
                         "rebuild_ref_capture_us=%llu rebuild_ref_encode_us=%llu "
@@ -772,6 +776,13 @@ int main(int argc, char **argv) {
                         static_cast<unsigned long long>(audio_tx.dtx_speech_rtp_packets),
                         static_cast<unsigned long long>(audio_tx.dtx_keepalive_rtp_packets),
                         static_cast<unsigned long long>(rebuild_tx.state_packets),
+                        static_cast<unsigned long long>(rebuild_tx.last_state_capture_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_state_send_start_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_state_send_time_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_state_pacer_delay_us),
+                        static_cast<unsigned long long>(rebuild_tx.last_state_capture_to_send_us),
+                        static_cast<unsigned long long>(rebuild_tx.state_capture_to_send_p50_us),
+                        static_cast<unsigned long long>(rebuild_tx.state_capture_to_send_p95_us),
                         static_cast<unsigned long long>(rebuild_tx.patch_transfers),
                         static_cast<unsigned long long>(rebuild_tx.patch_packets),
                         static_cast<unsigned long long>(rebuild_tx.parity_packets),

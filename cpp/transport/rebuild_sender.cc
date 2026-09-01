@@ -86,6 +86,10 @@ RebuildSenderSnapshot::RebuildSenderSnapshot()
       replaced_requests(0), state_packets(0), patch_transfers(0), patch_packets(0),
       parity_packets(0), patch_jpeg_bytes(0), sent_wire_bytes(0),
       cancelled_requests(0), last_reference_generation(0),
+      last_state_capture_time_us(0), last_state_send_start_time_us(0),
+      last_state_send_time_us(0), last_state_pacer_delay_us(0),
+      last_state_capture_to_send_us(0), state_capture_to_send_p50_us(0),
+      state_capture_to_send_p95_us(0),
       last_reference_capture_time_us(0), last_reference_encode_finish_time_us(0),
       last_reference_queue_enter_time_us(0),
       last_reference_first_packet_send_time_us(0),
@@ -237,6 +241,7 @@ bool RebuildSender::sendPacket(uint8_t type, const Request &request,
         return false;
     }
     const size_t wire_bytes = RatePacer::wireBytesForUdpPayload(bytes.size());
+    const uint64_t send_start_us = type == REBUILD_STATE ? steadyNowMicros() : 0;
     pacer_->waitForTokens(wire_bytes);
     if (!isEnabled()) {
         if (error) *error = "rebuild transfer cancelled";
@@ -252,9 +257,32 @@ bool RebuildSender::sendPacket(uint8_t type, const Request &request,
         if (error) *error = "rebuild UDP send failed";
         return false;
     }
+    const uint64_t sent_us = type == REBUILD_STATE ? steadyNowMicros() : 0;
     std::lock_guard<std::mutex> lock(mutex_);
     snapshot_.sent_wire_bytes += wire_bytes;
-    if (type == REBUILD_STATE) ++snapshot_.state_packets;
+    if (type == REBUILD_STATE) {
+        ++snapshot_.state_packets;
+        const uint64_t capture_time_us = request.frame->meta.capture_time_us;
+        const uint64_t capture_to_send_us = capture_time_us > 0 &&
+            sent_us >= capture_time_us ? sent_us - capture_time_us : 0;
+        snapshot_.last_state_capture_time_us = capture_time_us;
+        snapshot_.last_state_send_start_time_us = send_start_us;
+        snapshot_.last_state_send_time_us = sent_us;
+        snapshot_.last_state_pacer_delay_us = sent_us >= send_start_us
+            ? sent_us - send_start_us : 0;
+        snapshot_.last_state_capture_to_send_us = capture_to_send_us;
+        if (capture_to_send_us > 0) {
+            state_capture_to_send_samples_us_.push_back(capture_to_send_us);
+            if (state_capture_to_send_samples_us_.size() > 64U) {
+                state_capture_to_send_samples_us_.erase(
+                    state_capture_to_send_samples_us_.begin());
+            }
+            snapshot_.state_capture_to_send_p50_us = percentile(
+                state_capture_to_send_samples_us_, 0.50);
+            snapshot_.state_capture_to_send_p95_us = percentile(
+                state_capture_to_send_samples_us_, 0.95);
+        }
+    }
     else if (type == REBUILD_PATCH_DATA) ++snapshot_.patch_packets;
     else if (type == REBUILD_PATCH_PARITY) ++snapshot_.parity_packets;
     return true;

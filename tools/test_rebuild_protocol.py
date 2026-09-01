@@ -515,6 +515,257 @@ class RebuildProtocolTests(unittest.TestCase):
         self.assertGreater(score, 0.8)
         self.assertEqual(corrected, (37, 28))
 
+    def test_state_one_frame_extrapolation_is_bounded_and_observable(self):
+        first = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 180, 200, 2, 1),))
+        second = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 110, 80, 190, 200, 2, 1),))
+        receiver = RebuildReceiver(max_sync_ms=100)
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, 3, 5, 0, 1, 1, 1000, rb.build_state(first))), now=1.00)
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, 3, 5, 0, 2, 2, 1167, rb.build_state(second))), now=1.02)
+        selected, _, _, _, delta = receiver.scene_synced(
+            1334 * 90, frame_arrival_time=1.04, now=1.17)
+        self.assertEqual(delta, -167)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.targets[0].left, 120)
+        values = receiver.snapshot()
+        self.assertTrue(values["state_extrapolated"])
+        self.assertEqual(values["state_reason"], "STATE_EXTRAP")
+        self.assertEqual(values["state_sequence"], 2)
+        self.assertEqual(values["state_frame_id"], 2)
+        self.assertEqual(values["state_arrival_age_ms"], 20)
+        self.assertEqual(values["state_selected_age_ms"], 150)
+
+    def test_safe_history_beats_an_out_of_gate_future_state(self):
+        first = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 180, 200, 2, 1),))
+        second = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 110, 80, 190, 200, 2, 1),))
+        future = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 130, 80, 210, 200, 3, 1),))
+        receiver = RebuildReceiver(max_sync_ms=100)
+        for sequence, pts_ms, state in ((1, 1000, first), (2, 1167, second),
+                                        (3, 1500, future)):
+            receiver.on_datagram(rb.build_packet(rb.Packet(
+                rb.STATE, 3, 5, 0, sequence, sequence, pts_ms,
+                rb.build_state(state))), now=1.0 + sequence * 0.01)
+
+        selected, _, _, _, delta = receiver.scene_synced(1334 * 90)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(delta, -167)
+        self.assertEqual(selected.targets[0].left, 120)
+        self.assertEqual(receiver.snapshot()["state_reason"], "STATE_EXTRAP")
+
+    def test_state_extrapolation_rejects_track_or_class_switch(self):
+        first = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 0, 91, 100, 80, 180, 200, 2, 1),))
+        switched = rb.StateRecord(
+            640, 480, 640, 360, 6, 12, 1,
+            (rb.TargetState(4, 1, 91, 110, 80, 190, 200, 2, 1),))
+        receiver = RebuildReceiver(max_sync_ms=100)
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, 3, 5, 0, 1, 1, 1000, rb.build_state(first))), now=1.00)
+        receiver.on_datagram(rb.build_packet(rb.Packet(
+            rb.STATE, 3, 5, 0, 2, 2, 1167, rb.build_state(switched))), now=1.02)
+        selected, _, references, _, _ = receiver.scene_synced(1334 * 90)
+        self.assertIsNone(selected)
+        self.assertEqual(references, {})
+        self.assertEqual(receiver.snapshot()["state_reason"], "STATE_EXTRAP_CLASS_SWITCH")
+
+    def test_content_registration_clips_each_canvas_edge(self):
+        rng = np.random.default_rng(23)
+        patch = rng.integers(0, 255, (20, 24, 3), dtype=np.uint8)
+        mask = np.full((20, 24), 255, dtype=np.uint8)
+
+        def placed_canvas(x, y):
+            canvas = np.zeros((70, 90, 3), dtype=np.uint8)
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(canvas.shape[1], x + patch.shape[1]), min(
+                canvas.shape[0], y + patch.shape[0])
+            if x1 > x0 and y1 > y0:
+                canvas[y0:y1, x0:x1] = patch[y0 - y:y1 - y, x0 - x:x1 - x]
+            return canvas
+
+        for x, y in ((-8, 25), (80, 25), (30, -6), (30, 60)):
+            result = RebuildComposer._content_register(placed_canvas(x, y), patch, mask, x, y)
+            self.assertEqual(result.reason, "CONTENT_OK")
+            self.assertIsNotNone(result.position)
+            self.assertGreater(result.visible_ratio, 0.10)
+            self.assertLessEqual(abs(result.position[0] - x), 1)
+            self.assertLessEqual(abs(result.position[1] - y), 1)
+        invisible = RebuildComposer._content_register(
+            placed_canvas(-30, 25), patch, mask, -30, 25)
+        self.assertIsNone(invisible.position)
+        self.assertEqual(invisible.reason, "CONTENT_PATCH_TOO_LARGE")
+
+    def test_registration_is_independent_from_sr_render_asset(self):
+        class LanczosResolver:
+            scale = 2
+            available = False
+            model_name = "Lanczos"
+
+            @staticmethod
+            def upscale(image, target_size):
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        class SrResolver(LanczosResolver):
+            available = True
+            model_name = "Fake-SR"
+
+        rng = np.random.default_rng(31)
+        image = rng.integers(0, 255, (20, 24, 3), dtype=np.uint8)
+        reference = VisualReference(
+            generation=5, track_id=4, reference_generation=2,
+            crop=(20, 20, 44, 40), reference_bbox=(20, 20, 44, 40),
+            image=image, mask=np.full((20, 24), 255, dtype=np.uint8),
+            received_at=10.0, recovered_with_parity=False, pts_ms=1000)
+        target = rb.TargetState(4, 0, 91, 20, 20, 44, 40, 2, 1)
+        state = rb.StateRecord(90, 70, 90, 70, 6, 12, 1, (target,))
+        base = np.zeros((70, 90, 3), dtype=np.uint8)
+        base[20:40, 20:44] = image
+        miss = RebuildComposer(output_size=(90, 70), resolver=LanczosResolver())
+        hit = RebuildComposer(output_size=(90, 70), resolver=SrResolver())
+        try:
+            _, miss_mode = miss.render(
+                base, state, 5, {4: reference}, now=10.0,
+                video_rtp_timestamp=1000 * 90, source_sequence=1)
+            hit.cache[(5, 4, 2)] = np.zeros((40, 48, 3), dtype=np.uint8)
+            _, hit_mode = hit.render(
+                base, state, 5, {4: reference}, now=10.0,
+                video_rtp_timestamp=1000 * 90, source_sequence=1)
+            miss_values = miss.snapshot()
+            hit_values = hit.snapshot()
+            self.assertEqual(miss_mode, "ROI-LANCZOS")
+            self.assertEqual(hit_mode, "ROI-ESRGAN")
+            self.assertEqual(
+                (miss_values["registration_x"], miss_values["registration_y"]),
+                (hit_values["registration_x"], hit_values["registration_y"]))
+            self.assertAlmostEqual(
+                miss_values["match_score"], hit_values["match_score"], places=5)
+            self.assertEqual(miss_values["content_reason"], "CONTENT_OK")
+            self.assertEqual(hit_values["content_reason"], "CONTENT_OK")
+        finally:
+            miss.close()
+            hit.close()
+
+    def test_sr_handover_keeps_only_a_valid_old_same_track_esrgan_reference(self):
+        class SrResolver:
+            scale = 2
+            available = True
+            model_name = "Fake-SR"
+
+            @staticmethod
+            def upscale(image, target_size):
+                return cv2.resize(image, target_size, interpolation=cv2.INTER_NEAREST)
+
+        rng = np.random.default_rng(37)
+        image = rng.integers(0, 255, (20, 24, 3), dtype=np.uint8)
+        old = VisualReference(
+            generation=5, track_id=4, reference_generation=2,
+            crop=(20, 20, 44, 40), reference_bbox=(20, 20, 44, 40),
+            image=image, mask=np.full((20, 24), 255, dtype=np.uint8),
+            received_at=10.0, recovered_with_parity=False, pts_ms=1000)
+        new = dataclasses.replace(old, reference_generation=3, pts_ms=1167)
+        old_target = rb.TargetState(4, 0, 91, 20, 20, 44, 40, 2, 1)
+        new_target = dataclasses.replace(old_target, reference_generation=3)
+        old_state = rb.StateRecord(90, 70, 90, 70, 6, 12, 1, (old_target,))
+        new_state = rb.StateRecord(90, 70, 90, 70, 6, 12, 1, (new_target,))
+        base = np.zeros((70, 90, 3), dtype=np.uint8)
+        base[20:40, 20:44] = image
+        composer = RebuildComposer(output_size=(90, 70), resolver=SrResolver())
+        try:
+            composer.cache[(5, 4, 2)] = cv2.resize(image, (48, 40))
+            _, old_mode = composer.render(
+                base, old_state, 5, {4: old}, now=10.0,
+                video_rtp_timestamp=1000 * 90, source_sequence=1)
+            _, handover_mode = composer.render(
+                base, new_state, 5, {4: new}, now=10.1,
+                video_rtp_timestamp=1167 * 90, source_sequence=2)
+            values = composer.snapshot()
+            self.assertEqual(old_mode, "ROI-ESRGAN")
+            self.assertEqual(handover_mode, "ROI-ESRGAN")
+            self.assertTrue(values["sr_handover"])
+            self.assertEqual(values["sr_state"], "HANDOVER")
+            self.assertEqual(values["state_reference_generation"], 3)
+            self.assertEqual(values["reference_generation"], 2)
+
+            expired = dataclasses.replace(old, pts_ms=500)
+            fallback = RebuildComposer(output_size=(90, 70), resolver=SrResolver())
+            try:
+                fallback.cache[(5, 4, 2)] = cv2.resize(image, (48, 40))
+                fallback._handover_references[(5, 4)] = (expired, 0)
+                _, fallback_mode = fallback.render(
+                    base, new_state, 5, {4: new}, now=10.1,
+                    video_rtp_timestamp=1167 * 90, source_sequence=1)
+                self.assertEqual(fallback_mode, "ROI-LANCZOS")
+                self.assertFalse(fallback.snapshot()["sr_handover"])
+            finally:
+                fallback.close()
+        finally:
+            composer.close()
+
+    def test_bbox_ema_survives_reference_generation_but_resets_track(self):
+        composer = RebuildComposer(resolver=SuperResolver(enabled=False))
+        try:
+            first = rb.TargetState(4, 0, 91, 100, 80, 180, 200, 10, 1)
+            next_reference = rb.TargetState(4, 0, 91, 110, 80, 190, 200, 11, 1)
+            smoothed_first = composer._smooth_target(first, 5, now=1.0)
+            smoothed_second = composer._smooth_target(next_reference, 5, now=1.1)
+            self.assertEqual(smoothed_first.left, 100)
+            self.assertLess(smoothed_second.left, next_reference.left)
+            self.assertIn((5, 4), composer._smooth_boxes)
+            self.assertNotIn((5, 4, 11), composer._smooth_boxes)
+            new_track = rb.TargetState(5, 0, 91, 300, 80, 380, 200, 11, 1)
+            self.assertEqual(composer._smooth_target(new_track, 5, now=1.2).left, 300)
+        finally:
+            composer.close()
+
+    def test_base_frame_without_targets_has_an_explicit_reason(self):
+        empty = rb.StateRecord(64, 48, 64, 48, 6, 12, 1, ())
+        composer = RebuildComposer(output_size=(64, 48), resolver=SuperResolver(enabled=False))
+        try:
+            _, mode = composer.render(
+                np.zeros((48, 64, 3), dtype=np.uint8), empty, 5, {}, now=1.0,
+                video_rtp_timestamp=1000 * 90, source_sequence=1,
+                state_reason="STATE_TARGET_EMPTY")
+            self.assertEqual(mode, "BASE-LANCZOS")
+            self.assertEqual(composer.snapshot()["last_drop_reason"], "STATE_TARGET_EMPTY")
+        finally:
+            composer.close()
+
+    def test_age_drop_reports_local_and_state_reference_generation_lag(self):
+        target = rb.TargetState(4, 0, 91, 100, 80, 220, 280, 10, 1)
+        state = rb.StateRecord(640, 480, 640, 360, 6, 12, 1, (target,))
+        receiver = RebuildReceiver()
+        receiver.state_generation = 5
+        receiver.state_history.append((5, 1000, state, 10.0))
+        stale = dataclasses.replace(self._visual_reference(reference_generation=10), pts_ms=500)
+        receiver.reference_history[(4, 10)] = stale
+        receiver.reference_generations[4] = 12
+        selected, generation, references, _, _ = receiver.scene_synced(1000 * 90)
+        composer = RebuildComposer(resolver=SuperResolver(enabled=False))
+        try:
+            composer.render(
+                np.zeros((144, 256, 3), dtype=np.uint8), selected, generation,
+                references, now=10.0, video_rtp_timestamp=1000 * 90,
+                source_sequence=1)
+            values = composer.snapshot()
+            self.assertEqual(values["last_drop_reason"], "AGE")
+            self.assertEqual(values["state_reference_generation"], 10)
+            self.assertEqual(values["reference_generation"], 10)
+            self.assertEqual(receiver.snapshot()["local_reference_generations"][4], 12)
+        finally:
+            composer.close()
+
     def test_composer_reuses_native_sr_cache_when_box_size_changes(self):
         class FakeResolver:
             scale = 2
@@ -980,7 +1231,8 @@ class RebuildProtocolTests(unittest.TestCase):
                 video_rtp_timestamp=1000 * 90, source_sequence=1)
             values = composer.snapshot()
             self.assertEqual(mode, "BASE-LANCZOS")
-            self.assertEqual(values["last_drop_reason"], "CONTENT")
+            self.assertEqual(values["last_drop_reason"], "CONTENT_LOW_SCORE")
+            self.assertEqual(values["content_reason"], "CONTENT_LOW_SCORE")
             self.assertEqual(values["content_drops"], 1)
             self.assertEqual(values["scale_drops"], values["geom_scale_drops"])
         finally:

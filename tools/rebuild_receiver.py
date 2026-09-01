@@ -26,6 +26,7 @@ REFERENCE_CACHE_TTL_MS = 1000
 REFERENCE_CONTENT_HARD_MAX_AGE_MS = 450
 REFERENCE_FUTURE_MAX_MS = 100
 STATE_SYNC_MAX_MS = 100
+STATE_EXTRAPOLATION_MAX_MS = 200
 SR_MODEL_INPUT_SIDE = 96
 REGISTRATION_MIN_AREA_RATIO = 0.70
 REGISTRATION_MAX_AREA_RATIO = 1.40
@@ -98,6 +99,36 @@ class RegistrationResult:
     area_ratio: float
 
 
+@dataclasses.dataclass(frozen=True)
+class ContentRegistrationResult:
+    """Result of the stable-template identity check before a ROI is painted."""
+
+    position: Optional[Tuple[int, int]]
+    score: Optional[float]
+    attempted: bool
+    reason: str
+    visible_ratio: float
+
+    # Keep the small helper source-compatible with the previous tuple return
+    # while exposing a named diagnostic contract to the HUD and tests.
+    def __iter__(self):
+        yield self.position
+        yield self.score
+        yield self.attempted
+
+
+@dataclasses.dataclass(frozen=True)
+class StateHistoryItem:
+    """One received STATE plus transport metadata used for timing diagnosis."""
+
+    generation: int
+    pts_ms: int
+    state: rb.StateRecord
+    arrival_time: float
+    sequence: int
+    frame_id: int
+
+
 class RebuildReceiver:
     def __init__(self, port: int = 5009, max_sync_ms: int = STATE_SYNC_MAX_MS,
                  reference_cache_ttl_ms: int = REFERENCE_CACHE_TTL_MS,
@@ -118,8 +149,7 @@ class RebuildReceiver:
         self.state_pts_ms: Optional[int] = None
         self.last_selected_state_pts_ms: Optional[int] = None
         self.state_sequence: Optional[int] = None
-        self.state_history: Deque[Tuple[int, int, rb.StateRecord, float]] = \
-            collections.deque(maxlen=32)
+        self.state_history: Deque[StateHistoryItem] = collections.deque(maxlen=32)
         self.references: Dict[int, VisualReference] = {}
         # Keep the short set of generations that may still be named by a
         # PTS-synchronised STATE.  The newest PATCH for a track can arrive
@@ -159,6 +189,13 @@ class RebuildReceiver:
         # a seconds-old state must never move the clock used for registration.
         self.pts_bias_ms = 0
         self.raw_sync_ms: Optional[int] = None
+        self.last_state_delta_ms: Optional[int] = None
+        self.last_state_arrival_age_ms: Optional[int] = None
+        self.last_state_selected_age_ms: Optional[int] = None
+        self.last_state_extrapolated = False
+        self.last_state_reason = "STATE_NO_HISTORY"
+        self.last_state_sequence: Optional[int] = None
+        self.last_state_frame_id: Optional[int] = None
         self.pts_bias_samples: Deque[int] = collections.deque(maxlen=31)
         self._last_bias_observation: Optional[Tuple[int, int]] = None
         self.socket: Optional[socket.socket] = None
@@ -256,6 +293,14 @@ class RebuildReceiver:
                 self.state_updated = 0.0
                 self.state_pts_ms = None
                 self.state_sequence = None
+                self.last_selected_state_pts_ms = None
+                self.last_state_delta_ms = None
+                self.last_state_arrival_age_ms = None
+                self.last_state_selected_age_ms = None
+                self.last_state_extrapolated = False
+                self.last_state_reason = "STATE_NO_HISTORY"
+                self.last_state_sequence = None
+                self.last_state_frame_id = None
                 self.state_generation = packet.generation
                 # Incomplete fragments from the previous profile generation
                 # can never form a valid current reference.
@@ -344,7 +389,9 @@ class RebuildReceiver:
                     self.state_updated = now
                     self.state_pts_ms = packet.pts_ms
                     self.state_sequence = packet.sequence
-                    state_item = (packet.generation, packet.pts_ms, state, now)
+                    state_item = StateHistoryItem(
+                        packet.generation, packet.pts_ms, state, now,
+                        packet.sequence, packet.frame_id)
                     # A completion STATE can share the source PTS with the
                     # earlier flags=0 STATE, while PATCH fragments for that
                     # reference and later states have already interleaved in
@@ -353,8 +400,8 @@ class RebuildReceiver:
                     # reference-generation metadata.
                     self.state_history = collections.deque(
                         (item for item in self.state_history
-                         if not (item[0] == packet.generation and
-                                 item[1] == packet.pts_ms)),
+                         if not (self._state_item_values(item)[0] == packet.generation and
+                                 self._state_item_values(item)[1] == packet.pts_ms)),
                         maxlen=self.state_history.maxlen)
                     self.state_history.append(state_item)
             if decoded_reference is not None:
@@ -419,6 +466,16 @@ class RebuildReceiver:
     def _signed_pts_delta(left: int, right: int) -> int:
         return ((left - right + 0x80000000) & 0xFFFFFFFF) - 0x80000000
 
+    @staticmethod
+    def _state_item_values(item) -> Tuple[int, int, rb.StateRecord, float,
+                                           Optional[int], Optional[int]]:
+        """Read current history entries and legacy test fixtures alike."""
+        if isinstance(item, StateHistoryItem):
+            return (item.generation, item.pts_ms, item.state, item.arrival_time,
+                    item.sequence, item.frame_id)
+        generation, pts_ms, state, arrival_time = item
+        return generation, pts_ms, state, arrival_time, None, None
+
     def _observe_pts_bias(self, raw_delta_ms: int, state_pts_ms: int,
                           video_rtp_timestamp: int) -> None:
         """Update the DC offset estimate once per decoded video timestamp."""
@@ -442,43 +499,66 @@ class RebuildReceiver:
     @classmethod
     def _extrapolate_state(cls, selected: rb.StateRecord, selected_pts: int,
                            previous: Optional[rb.StateRecord], previous_pts: Optional[int],
-                           video_pts: int, max_sync_ms: int) -> rb.StateRecord:
-        """Advance boxes a short distance using the last observed velocity.
+                           video_pts: int, max_offset_ms: int
+                           ) -> Tuple[Optional[rb.StateRecord], str]:
+        """Safely advance a one-source-frame-old STATE to the video PTS.
 
-        STATE is sent at the source rate while the rebuilt display is usually
-        faster.  A nearest-state lookup alone leaves a moving target one
-        capture interval behind.  Predict only within the already bounded PTS
-        window and preserve every non-geometric field; the registration gate
-        below still fails closed when the prediction is implausible.
+        Extrapolation is deliberately a narrow fallback for STATE jitter.  It
+        is never a substitute for the playout buffer: identity must be stable
+        across two observations and the measured motion/scale must be sane.
         """
         if previous is None or previous_pts is None:
-            return selected
+            return None, "STATE_EXTRAP_NO_PREVIOUS"
         sample_delta = cls._signed_pts_delta(selected_pts, previous_pts)
         offset = cls._signed_pts_delta(video_pts, selected_pts)
-        if sample_delta <= 0 or abs(offset) > max_sync_ms or sample_delta > 2000:
-            return selected
+        if sample_delta <= 0 or sample_delta > 2000:
+            return None, "STATE_EXTRAP_SAMPLE_INVALID"
+        if offset <= 0 or offset > max_offset_ms:
+            return None, "STATE_TOO_OLD"
+        selected_targets = {target.track_id: target for target in selected.targets}
         previous_targets = {target.track_id: target for target in previous.targets}
+        if (not selected_targets or set(selected_targets) != set(previous_targets)):
+            return None, "STATE_EXTRAP_TRACK_SWITCH"
+        ratio = float(offset) / float(sample_delta)
         predicted = []
-        for target in selected.targets:
-            old = previous_targets.get(target.track_id)
-            if old is None or old.class_id != target.class_id:
-                predicted.append(target)
-                continue
-            ratio = float(offset) / float(sample_delta)
-            values = []
-            for current, prior in zip(
-                    (target.left, target.top, target.right, target.bottom),
-                    (old.left, old.top, old.right, old.bottom)):
-                values.append(int(round(current + (current - prior) * ratio)))
-            width = max(1, target.right - target.left)
-            height = max(1, target.bottom - target.top)
-            left = max(0, min(selected.source_width - width, values[0]))
-            top = max(0, min(selected.source_height - height, values[1]))
+        for track_id, target in selected_targets.items():
+            old = previous_targets[track_id]
+            if old.class_id != target.class_id:
+                return None, "STATE_EXTRAP_CLASS_SWITCH"
+            old_width = max(1.0, float(old.right - old.left))
+            old_height = max(1.0, float(old.bottom - old.top))
+            width = max(1.0, float(target.right - target.left))
+            height = max(1.0, float(target.bottom - target.top))
+            if (width / old_width < 0.5 or width / old_width > 2.0 or
+                    height / old_height < 0.5 or height / old_height > 2.0):
+                return None, "STATE_EXTRAP_SCALE"
+            old_cx = (old.left + old.right) * 0.5
+            old_cy = (old.top + old.bottom) * 0.5
+            current_cx = (target.left + target.right) * 0.5
+            current_cy = (target.top + target.bottom) * 0.5
+            if (abs(current_cx - old_cx) > 1.5 * max(old_width, width) or
+                    abs(current_cy - old_cy) > 1.5 * max(old_height, height)):
+                return None, "STATE_EXTRAP_VELOCITY"
+            predicted_cx = current_cx + (current_cx - old_cx) * ratio
+            predicted_cy = current_cy + (current_cy - old_cy) * ratio
+            projected_width = int(round(width))
+            projected_height = int(round(height))
+            if (projected_width <= 0 or projected_height <= 0 or
+                    projected_width > selected.source_width or
+                    projected_height > selected.source_height):
+                return None, "STATE_EXTRAP_BOUNDS"
+            left = int(round(predicted_cx - projected_width * 0.5))
+            top = int(round(predicted_cy - projected_height * 0.5))
+            left = max(0, min(selected.source_width - projected_width, left))
+            top = max(0, min(selected.source_height - projected_height, top))
             predicted.append(dataclasses.replace(
-                target, left=left, top=top, right=left + width, bottom=top + height))
-        return dataclasses.replace(selected, targets=tuple(predicted))
+                target, left=left, top=top,
+                right=left + projected_width, bottom=top + projected_height))
+        return dataclasses.replace(selected, targets=tuple(predicted)), "STATE_EXTRAP"
 
-    def scene_synced(self, video_rtp_timestamp: Optional[int]) -> Tuple[
+    def scene_synced(self, video_rtp_timestamp: Optional[int],
+                     frame_arrival_time: Optional[float] = None,
+                     now: Optional[float] = None) -> Tuple[
             Optional[rb.StateRecord], int, Dict[int, VisualReference], float,
             Optional[int]]:
         """Select a close semantic state or fail closed to the base video.
@@ -486,61 +566,151 @@ class RebuildReceiver:
         A nearest state is not necessarily a usable state: while a large JPEG
         reference is paced, the newest state can be seconds behind the H.265
         frame.  Painting that old state is the floating-target failure.  Keep
-        reporting the signed delta for the HUD, but never return paintable
-        state/references outside the bounded PTS window.
+        reporting the signed delta for the HUD.  A separately constrained
+        one-frame extrapolation may bridge a small older-state gap; every
+        other out-of-window state remains fail-closed.
         """
+        selection_now = time.monotonic() if now is None else now
         with self.lock:
             generation = -1 if self.state_generation is None else self.state_generation
             selected_state = None
             selected_updated = self.state_updated
             selected_delta = None
             self.last_selected_state_pts_ms = None
+            self.last_state_delta_ms = None
+            self.last_state_arrival_age_ms = None
+            self.last_state_selected_age_ms = None
+            self.last_state_extrapolated = False
+            self.last_state_sequence = None
+            self.last_state_frame_id = None
+            self.last_state_reason = "STATE_NO_HISTORY"
             effective_video_rtp_timestamp = video_rtp_timestamp
-            if video_rtp_timestamp is not None and self.state_history:
-                candidates = [item for item in self.state_history if item[0] == generation]
+            if video_rtp_timestamp is None:
+                self.last_state_reason = "STATE_NO_VIDEO_PTS"
+            elif not self.state_history:
+                self.last_state_reason = "STATE_NO_HISTORY"
+            else:
+                candidates = [item for item in self.state_history
+                              if self._state_item_values(item)[0] == generation]
                 if candidates:
                     raw_selected = min(
                         candidates,
                         key=lambda item: abs(self._signed_pts_delta(
-                            (item[1] * 90) & 0xFFFFFFFF, video_rtp_timestamp)))
+                            (self._state_item_values(item)[1] * 90) & 0xFFFFFFFF,
+                            video_rtp_timestamp)))
+                    _, raw_pts_ms, _, _, _, _ = self._state_item_values(raw_selected)
                     raw_delta_ticks = self._signed_pts_delta(
-                        (raw_selected[1] * 90) & 0xFFFFFFFF, video_rtp_timestamp)
+                        (raw_pts_ms * 90) & 0xFFFFFFFF, video_rtp_timestamp)
                     self._observe_pts_bias(
-                        int(round(raw_delta_ticks / 90.0)), raw_selected[1],
+                        int(round(raw_delta_ticks / 90.0)), raw_pts_ms,
                         video_rtp_timestamp)
                     effective_video_rtp_timestamp = self._effective_video_timestamp(
                         video_rtp_timestamp)
-                    selected = min(
-                        candidates,
-                        key=lambda item: abs(self._signed_pts_delta(
-                            (item[1] * 90) & 0xFFFFFFFF,
-                            effective_video_rtp_timestamp)))
-                    selected_state = selected[2]
-                    selected_updated = selected[3]
-                    self.last_selected_state_pts_ms = selected[1]
+                    # A future STATE beyond the direct gate cannot render this
+                    # source frame.  Prefer a one-frame-old history item that
+                    # can be safely extrapolated over an equally-near future
+                    # item, otherwise packet reordering needlessly causes a
+                    # fail-closed BASE frame.
+                    candidate_deltas = [
+                        (item, int(round(self._signed_pts_delta(
+                            (self._state_item_values(item)[1] * 90) & 0xFFFFFFFF,
+                            effective_video_rtp_timestamp) / 90.0)))
+                        for item in candidates
+                    ]
+                    direct_candidates = [
+                        pair for pair in candidate_deltas
+                        if abs(pair[1]) <= self.max_sync_ms
+                    ]
+                    extrapolation_candidates = [
+                        pair for pair in candidate_deltas
+                        if -STATE_EXTRAPOLATION_MAX_MS <= pair[1] < -self.max_sync_ms
+                    ]
+                    if direct_candidates:
+                        selected = min(
+                            direct_candidates,
+                            key=lambda pair: (abs(pair[1]), 0 if pair[1] <= 0 else 1))[0]
+                    elif extrapolation_candidates:
+                        # Values are negative here, so the largest is closest
+                        # to the current video frame and has the least motion
+                        # prediction error.
+                        selected = max(extrapolation_candidates, key=lambda pair: pair[1])[0]
+                    else:
+                        selected = min(
+                            candidate_deltas,
+                            key=lambda pair: (abs(pair[1]), 0 if pair[1] < 0 else 1))[0]
+                    (_, selected_pts_ms, selected_state, selected_updated,
+                     selected_sequence, selected_frame_id) = self._state_item_values(selected)
+                    self.last_selected_state_pts_ms = selected_pts_ms
+                    self.last_state_sequence = selected_sequence
+                    self.last_state_frame_id = selected_frame_id
+                    self.last_state_selected_age_ms = int(round(
+                        max(0.0, selection_now - selected_updated) * 1000.0))
+                    if frame_arrival_time is not None:
+                        self.last_state_arrival_age_ms = int(round(
+                            (frame_arrival_time - selected_updated) * 1000.0))
                     delta_ticks = self._signed_pts_delta(
-                        (selected[1] * 90) & 0xFFFFFFFF,
+                        (selected_pts_ms * 90) & 0xFFFFFFFF,
                         effective_video_rtp_timestamp)
                     selected_delta = int(round(delta_ticks / 90.0))
-                    # Use the immediately older state for a bounded linear
-                    # prediction.  This removes the systematic half-frame
-                    # lag without allowing an old reference to follow a new
-                    # scene indefinitely.
-                    older = [item for item in candidates
-                             if self._signed_pts_delta(selected[1], item[1]) > 0]
-                    previous = None
-                    if older:
-                        previous = min(
+                    self.last_state_delta_ms = selected_delta
+                    if abs(selected_delta) <= self.max_sync_ms:
+                        # Keep the small within-gate motion prediction that
+                        # removes a half-frame detector lag, but a real STATE
+                        # remains valid when prediction cannot be proven safe.
+                        if selected_delta < 0 and selected_state.targets:
+                            older = [item for item in candidates
+                                     if self._signed_pts_delta(
+                                         selected_pts_ms,
+                                         self._state_item_values(item)[1]) > 0]
+                            previous = None if not older else min(
+                                older,
+                                key=lambda item: self._signed_pts_delta(
+                                    selected_pts_ms, self._state_item_values(item)[1]))
+                            predicted, _ = self._extrapolate_state(
+                                selected_state, selected_pts_ms,
+                                None if previous is None else self._state_item_values(previous)[2],
+                                None if previous is None else self._state_item_values(previous)[1],
+                                selected_pts_ms - selected_delta,
+                                self.max_sync_ms)
+                            if predicted is not None:
+                                selected_state = predicted
+                                self.last_state_extrapolated = True
+                                self.last_state_reason = "STATE_EXTRAP"
+                            else:
+                                self.last_state_reason = "STATE_OK"
+                        else:
+                            self.last_state_reason = (
+                                "STATE_TARGET_EMPTY" if not selected_state.targets else "STATE_OK")
+                    elif selected_delta < -self.max_sync_ms and \
+                            abs(selected_delta) <= STATE_EXTRAPOLATION_MAX_MS:
+                        older = [item for item in candidates
+                                 if self._signed_pts_delta(
+                                     selected_pts_ms,
+                                     self._state_item_values(item)[1]) > 0]
+                        previous = None if not older else min(
                             older,
-                            key=lambda item: self._signed_pts_delta(selected[1], item[1]))
-                    selected_state = self._extrapolate_state(
-                        selected_state, selected[1],
-                        None if previous is None else previous[2],
-                        None if previous is None else previous[1],
-                        selected[1] - selected_delta,
-                        max(self.max_sync_ms * 4, 400))
-            if (video_rtp_timestamp is None or selected_delta is None or
-                    abs(selected_delta) > self.max_sync_ms):
+                            key=lambda item: self._signed_pts_delta(
+                                selected_pts_ms, self._state_item_values(item)[1]))
+                        predicted, reason = self._extrapolate_state(
+                            selected_state, selected_pts_ms,
+                            None if previous is None else self._state_item_values(previous)[2],
+                            None if previous is None else self._state_item_values(previous)[1],
+                            selected_pts_ms - selected_delta,
+                            STATE_EXTRAPOLATION_MAX_MS)
+                        if predicted is not None:
+                            selected_state = predicted
+                            self.last_state_extrapolated = True
+                            self.last_state_reason = reason
+                        else:
+                            selected_state = None
+                            self.last_state_reason = reason
+                    else:
+                        selected_state = None
+                        self.last_state_reason = (
+                            "STATE_TOO_OLD" if selected_delta < 0 else "STATE_TOO_FUTURE")
+                else:
+                    self.last_state_reason = "STATE_GEN_MISMATCH"
+            if selected_state is None:
                 if (video_rtp_timestamp is not None and selected_delta is not None and
                         self._last_sync_drop_timestamp != video_rtp_timestamp):
                     self.sync_drops += 1
@@ -610,8 +780,17 @@ class RebuildReceiver:
                 "pts_bias_ms": self.pts_bias_ms,
                 "pts_bias_samples": len(self.pts_bias_samples),
                 "raw_sync_ms": self.raw_sync_ms,
+                "state_delta_ms": self.last_state_delta_ms,
                 "state_pts_ms": self.last_selected_state_pts_ms,
                 "state_age": None if not self.state_updated else now - self.state_updated,
+                "state_arrival_age_ms": self.last_state_arrival_age_ms,
+                "state_selected_age_ms": self.last_state_selected_age_ms,
+                "state_extrapolated": self.last_state_extrapolated,
+                "state_reason": self.last_state_reason,
+                "state_sequence": self.last_state_sequence,
+                "state_frame_id": self.last_state_frame_id,
+                "local_reference_generations": dict(self.reference_generations),
+                "state_reference_generations": dict(self.state_reference_generations),
             }
 
     def start(self, stopping: threading.Event) -> None:
@@ -928,8 +1107,18 @@ class RebuildComposer:
         self.last_ref_content_age_ms: Optional[int] = None
         self.last_reference_pts_ms: Optional[int] = None
         self.last_reference_generation: Optional[int] = None
+        self.last_state_reference_generation: Optional[int] = None
+        self.last_track_id: Optional[int] = None
         self.last_match_score: Optional[float] = None
         self.last_drop_reason = "NONE"
+        self.last_content_reason = "CONTENT_NOT_RUN"
+        self.last_registration_x: Optional[int] = None
+        self.last_registration_y: Optional[int] = None
+        self.last_patch_width = 0
+        self.last_patch_height = 0
+        self.last_mask_width = 0
+        self.last_mask_height = 0
+        self.last_visible_ratio = 0.0
         self.last_geom_dx_ratio = 0.0
         self.last_geom_dy_ratio = 0.0
         self.last_geom_area_ratio = 0.0
@@ -941,6 +1130,10 @@ class RebuildComposer:
         self.new_reference_first_frame_sr_hits = 0
         self._seen_reference_frame_keys = set()
         self._smooth_boxes: Dict[tuple, Tuple[float, float, float, float]] = {}
+        self._smooth_seen_at: Dict[tuple, float] = {}
+        self._handover_references: Dict[Tuple[int, int], Tuple[VisualReference, int]] = {}
+        self.sr_handover_frames = 0
+        self.last_sr_handover = False
         self._smooth_generation: Optional[int] = None
         self._composed_source_sequence: Optional[int] = None
         self._composed_generation: Optional[int] = None
@@ -970,6 +1163,7 @@ class RebuildComposer:
             # previous stream.  The bounded pixel cache is harmless but the
             # newest-reference index must not grow across generations.
             self._known_references.clear()
+            self._handover_references.clear()
         self._latest_video_rtp_timestamp = video_rtp_timestamp
         self._latest_pts_bias_ms = pts_bias_ms
         self._latest_generation = generation
@@ -1058,7 +1252,7 @@ class RebuildComposer:
         self.last_drop_reason = reason
         if reason == "NOREF":
             self.no_reference_drops += 1
-        elif reason == "STATE":
+        elif reason == "STATE" or reason.startswith("STATE_"):
             self.state_drops += 1
         elif reason == "GEN":
             self.generation_drops += 1
@@ -1070,6 +1264,8 @@ class RebuildComposer:
             self.geom_scale_drops += 1
         elif reason == "GEOM_OUTSIDE":
             self.geom_outside_drops += 1
+        elif reason.startswith("CONTENT_"):
+            self.content_drops += 1
 
     def _record_first_reference_frame(self, key: tuple) -> bool:
         if key in self._seen_reference_frame_keys:
@@ -1236,6 +1432,29 @@ class RebuildComposer:
         mask = cv2.resize(reference.mask, size, interpolation=cv2.INTER_LINEAR)
         return patch, mask, enhanced
 
+    def _handover_reference(self, current: VisualReference,
+                            target: rb.TargetState, generation: int,
+                            now: float, cache_keys: set) -> Optional[VisualReference]:
+        """Return a still-safe old ESRGAN reference while a new one warms up."""
+        previous = self._handover_references.get((generation, target.track_id))
+        if previous is None:
+            return None
+        reference, class_id = previous
+        if (class_id != target.class_id or reference.generation != generation or
+                reference.track_id != target.track_id or
+                reference.reference_generation == current.reference_generation):
+            return None
+        if (now - reference.received_at > self.reference_cache_ttl_ms / 1000.0 or
+                not self.resolver.available or
+                self._reference_key(reference) not in cache_keys):
+            return None
+        content_age_ms = self._content_age_ms(reference)
+        if (content_age_ms is None or
+                content_age_ms > self.reference_content_hard_max_age_ms or
+                content_age_ms < -self.reference_future_max_ms):
+            return None
+        return reference
+
     @staticmethod
     def _nearly_grayscale(image: np.ndarray) -> bool:
         """Detect a neutral-chroma base without mistaking dim colour for gray."""
@@ -1286,76 +1505,121 @@ class RebuildComposer:
             patch_roi * alpha + base * (1.0 - alpha)).astype(np.uint8)
 
     @staticmethod
+    def _registration_template(reference: VisualReference,
+                               size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+        """Create the fixed raw-JPEG template used for content registration.
+
+        This deliberately does not read the SR cache.  The base frame is a
+        compressed image domain, so Real-ESRGAN detail must not alter the
+        identity decision or its correlation score from one source frame to
+        the next.
+        """
+        image = cv2.resize(reference.image, size, interpolation=cv2.INTER_LANCZOS4)
+        mask = cv2.resize(reference.mask, size, interpolation=cv2.INTER_LINEAR)
+        return image, mask
+
+    @staticmethod
     def _content_register(canvas: np.ndarray, patch: np.ndarray, mask: np.ndarray,
                           x: int, y: int, search_radius: int = 8,
-                          minimum_score: float = 0.32
-                          ) -> Tuple[Optional[Tuple[int, int]], Optional[float], bool]:
-        """Align a reference patch to the current base within a small window.
+                          minimum_score: float = 0.32) -> ContentRegistrationResult:
+        """Align a stable, clipped raw template to the current base image.
 
-        Geometry predicts where a target moved; this correlation step uses the
-        decoded content to remove the remaining few-pixel detector jitter.  A
-        low-texture target has no reliable signal and is accepted at the
-        geometric position (``attempted=False``).  When a textured template
-        is available, a low peak is a fail-closed registration drop instead of
-        painting a stale coloured patch over unrelated background.
+        Partial image-edge visibility is normal for a crop carrying margin.
+        Registration therefore works in the visible template region and only
+        fails closed when too little foreground remains or the correlation is
+        genuinely unsafe.
         """
-        if patch.ndim != 3 or canvas.ndim != 3 or patch.shape[:2] != mask.shape[:2]:
-            return None, None, True
+        if (patch.ndim != 3 or canvas.ndim != 3 or mask.ndim != 2 or
+                patch.shape[:2] != mask.shape[:2]):
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_SHAPE", 0.0)
         height, width = patch.shape[:2]
-        if width < 4 or height < 4 or width > canvas.shape[1] or height > canvas.shape[0]:
-            return None, None, True
+        if width < 4 or height < 4 or canvas.shape[0] < 3 or canvas.shape[1] < 3:
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_TEMPLATE_INVALID", 0.0)
         binary = (mask >= 128).astype(np.uint8)
+        foreground_total = int(np.count_nonzero(binary))
+        if foreground_total < 16:
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_TEMPLATE_INVALID", 0.0)
+        patch_left = max(0, -x)
+        patch_top = max(0, -y)
+        patch_right = min(width, canvas.shape[1] - x)
+        patch_bottom = min(height, canvas.shape[0] - y)
+        if patch_right <= patch_left or patch_bottom <= patch_top:
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_PATCH_TOO_LARGE", 0.0)
+        visible_foreground = int(np.count_nonzero(
+            binary[patch_top:patch_bottom, patch_left:patch_right]))
+        visible_ratio = visible_foreground / float(foreground_total)
+        if visible_foreground < 16 or visible_ratio < 0.10:
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_PATCH_TOO_LARGE", visible_ratio)
         ys, xs = np.where(binary > 0)
-        if len(xs) >= 16:
-            left, right = int(xs.min()), int(xs.max()) + 1
-            top, bottom = int(ys.min()), int(ys.max()) + 1
-            margin = max(1, min(4, int(round(min(width, height) * 0.04))))
-            left = max(0, left - margin)
-            top = max(0, top - margin)
-            right = min(width, right + margin)
-            bottom = min(height, bottom + margin)
-        else:
-            left, top, right, bottom = 0, 0, width, height
+        left, right = int(xs.min()), int(xs.max()) + 1
+        top, bottom = int(ys.min()), int(ys.max()) + 1
+        margin = max(1, min(4, int(round(min(width, height) * 0.04))))
+        left = max(patch_left, left - margin)
+        top = max(patch_top, top - margin)
+        right = min(patch_right, right + margin)
+        bottom = min(patch_bottom, bottom + margin)
+        if right - left < 3 or bottom - top < 3:
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_SEARCH_INVALID", visible_ratio)
         template = cv2.cvtColor(patch[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
         template = cv2.GaussianBlur(template, (3, 3), 0)
-        if template.shape[1] < 3 or template.shape[0] < 3:
-            return (x, y), None, False
         if float(template.std()) < 2.0:
-            return (x, y), None, False
+            return ContentRegistrationResult(
+                (x, y), None, False, "CONTENT_LOW_TEXTURE", visible_ratio)
 
         predicted_x = x + left
         predicted_y = y + top
         max_x = canvas.shape[1] - template.shape[1]
         max_y = canvas.shape[0] - template.shape[0]
-        search_x = max(0, min(max_x, predicted_x - search_radius))
-        search_y = max(0, min(max_y, predicted_y - search_radius))
-        search_right = min(canvas.shape[1], predicted_x + template.shape[1] + search_radius)
-        search_bottom = min(canvas.shape[0], predicted_y + template.shape[0] + search_radius)
+        if max_x < 0 or max_y < 0:
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_SEARCH_INVALID", visible_ratio)
+        candidate_left = max(0, min(max_x, predicted_x - search_radius))
+        candidate_top = max(0, min(max_y, predicted_y - search_radius))
+        candidate_right = max(0, min(max_x, predicted_x + search_radius))
+        candidate_bottom = max(0, min(max_y, predicted_y + search_radius))
+        search_right = candidate_right + template.shape[1]
+        search_bottom = candidate_bottom + template.shape[0]
         search = cv2.cvtColor(
-            canvas[search_y:search_bottom, search_x:search_right], cv2.COLOR_BGR2GRAY)
+            canvas[candidate_top:search_bottom, candidate_left:search_right],
+            cv2.COLOR_BGR2GRAY)
         search = cv2.GaussianBlur(search, (3, 3), 0)
         if (search.shape[1] < template.shape[1] or
-                search.shape[0] < template.shape[0] or
-                float(search.std()) < 1.0):
-            return (x, y), None, False
+                search.shape[0] < template.shape[0]):
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_SEARCH_INVALID", visible_ratio)
+        if float(search.std()) < 1.0:
+            return ContentRegistrationResult(
+                (x, y), None, False, "CONTENT_LOW_TEXTURE", visible_ratio)
         try:
             correlation = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
         except cv2.error:
-            return (x, y), None, False
+            return ContentRegistrationResult(
+                None, None, True, "CONTENT_CV_ERROR", visible_ratio)
         _, score, _, location = cv2.minMaxLoc(correlation)
         score = float(score)
-        corrected = (search_x + int(location[0]) - left,
-                     search_y + int(location[1]) - top)
+        corrected = (candidate_left + int(location[0]) - left,
+                     candidate_top + int(location[1]) - top)
         if score < minimum_score:
-            return None, score, True
-        return corrected, score, True
+            return ContentRegistrationResult(
+                None, score, True, "CONTENT_LOW_SCORE", visible_ratio)
+        return ContentRegistrationResult(
+            corrected, score, True, "CONTENT_OK", visible_ratio)
 
-    def _smooth_target(self, target: rb.TargetState, generation: int) -> rb.TargetState:
+    def _smooth_target(self, target: rb.TargetState, generation: int,
+                       now: float) -> rb.TargetState:
         """EMA detector boxes while resetting on a real track jump."""
-        key = (generation, target.track_id, target.reference_generation)
+        key = (generation, target.track_id)
         current = tuple(float(value) for value in
                         (target.left, target.top, target.right, target.bottom))
         previous = self._smooth_boxes.get(key)
+        if previous is not None and now - self._smooth_seen_at.get(key, now) > 1.0:
+            previous = None
         if previous is None:
             smoothed = current
         else:
@@ -1365,14 +1629,21 @@ class RebuildComposer:
             current_cy = (current[1] + current[3]) * 0.5
             previous_cx = (previous[0] + previous[2]) * 0.5
             previous_cy = (previous[1] + previous[3]) * 0.5
+            current_width = max(1.0, current[2] - current[0])
+            current_height = max(1.0, current[3] - current[1])
             if (abs(current_cx - previous_cx) > 0.60 * previous_width or
-                    abs(current_cy - previous_cy) > 0.60 * previous_height):
+                    abs(current_cy - previous_cy) > 0.60 * previous_height or
+                    current_width / previous_width < 0.5 or
+                    current_width / previous_width > 2.0 or
+                    current_height / previous_height < 0.5 or
+                    current_height / previous_height > 2.0):
                 smoothed = current
             else:
                 alpha = 0.45
                 smoothed = tuple(alpha * now_value + (1.0 - alpha) * old_value
                                  for now_value, old_value in zip(current, previous))
         self._smooth_boxes[key] = smoothed
+        self._smooth_seen_at[key] = now
         rounded = tuple(int(round(value)) for value in smoothed)
         left, top, right, bottom = rounded
         if right <= left:
@@ -1467,7 +1738,8 @@ class RebuildComposer:
                references: Dict[int, VisualReference], now: Optional[float] = None,
                video_rtp_timestamp: Optional[int] = None,
                pts_bias_ms: int = 0,
-               source_sequence: Optional[int] = None) -> Tuple[np.ndarray, str]:
+               source_sequence: Optional[int] = None,
+               state_reason: str = "STATE_NO_HISTORY") -> Tuple[np.ndarray, str]:
         now = time.monotonic() if now is None else now
         active_track_ids = (set() if state is None else
                             {target.track_id for target in state.targets})
@@ -1507,32 +1779,48 @@ class RebuildComposer:
         self.last_ref_content_age_ms = None
         self.last_reference_pts_ms = None
         self.last_reference_generation = None
+        self.last_state_reference_generation = None
+        self.last_track_id = None
         self.last_match_score = None
         self.last_rebuild_percent = 0.0
         self.last_drop_reason = "NONE"
+        self.last_content_reason = "CONTENT_NOT_RUN"
+        self.last_registration_x = None
+        self.last_registration_y = None
+        self.last_patch_width = 0
+        self.last_patch_height = 0
+        self.last_mask_width = 0
+        self.last_mask_height = 0
+        self.last_visible_ratio = 0.0
         self.last_geom_dx_ratio = 0.0
         self.last_geom_dy_ratio = 0.0
         self.last_geom_area_ratio = 0.0
         self.last_sr_state = "MISS"
+        self.last_sr_handover = False
         used_sr = False
         effective_video_rtp_timestamp = None
         if video_rtp_timestamp is not None:
             effective_video_rtp_timestamp = (
                 video_rtp_timestamp + int(round(pts_bias_ms * 90.0))) & 0xFFFFFFFF
-        active_smooth_keys = set()
         if state is not None and state.source_width > 0 and state.source_height > 0:
             scale_x = output_width / float(state.source_width)
             scale_y = output_height / float(state.source_height)
             if self._smooth_generation != generation:
                 self._smooth_boxes.clear()
+                self._smooth_seen_at.clear()
                 self._smooth_generation = generation
+            if not state.targets:
+                self._record_drop(
+                    state_reason if state_reason.startswith("STATE_") else
+                    "STATE_TARGET_EMPTY")
             for raw_target in state.targets:
-                target = self._smooth_target(raw_target, generation)
-                active_smooth_keys.add(
-                    (generation, target.track_id, target.reference_generation))
+                target = self._smooth_target(raw_target, generation, now)
+                self.last_track_id = target.track_id
+                self.last_state_reference_generation = target.reference_generation
                 reference = references.get(target.track_id)
                 if reference is None:
-                    self._record_drop("NOREF")
+                    self._record_drop(
+                        "STATE_TARGET_MISSING" if target.reference_generation else "NOREF")
                     continue
                 if (reference.generation != generation or
                         (target.reference_generation and
@@ -1548,7 +1836,7 @@ class RebuildComposer:
                 self.last_reference_generation = reference.reference_generation
                 if effective_video_rtp_timestamp is None:
                     self.timing_drops += 1
-                    self._record_drop("STATE")
+                    self._record_drop("STATE_NO_VIDEO_PTS")
                     continue
                 content_age_ticks = RebuildReceiver._signed_pts_delta(
                     effective_video_rtp_timestamp,
@@ -1563,8 +1851,29 @@ class RebuildComposer:
                     self.future_drops += 1
                     self._record_drop("FUTURE")
                     continue
-                reference_key = self._reference_key(reference)
-                first_reference_frame = self._record_first_reference_frame(reference_key)
+                selected_reference_key = self._reference_key(reference)
+                first_reference_frame = self._record_first_reference_frame(
+                    selected_reference_key)
+                # New reference SR work is already queued above.  If it is
+                # not ready on this source boundary, a previous same-track
+                # ESRGAN result can bridge the handover only while its own
+                # PTS age and geometry remain valid.
+                using_handover = False
+                if (not (self.resolver.available and
+                         selected_reference_key in render_cache_keys)):
+                    handover = self._handover_reference(
+                        reference, target, generation, now, render_cache_keys)
+                    if handover is not None:
+                        reference = handover
+                        using_handover = True
+                        self.last_sr_handover = True
+                        self.last_ref_age = max(0.0, now - reference.received_at)
+                        self.last_reference_pts_ms = reference.pts_ms
+                        self.last_reference_generation = reference.reference_generation
+                        handover_age_ticks = RebuildReceiver._signed_pts_delta(
+                            effective_video_rtp_timestamp,
+                            (reference.pts_ms * 90) & 0xFFFFFFFF)
+                        self.last_ref_content_age_ms = int(round(handover_age_ticks / 90.0))
                 geometry = self._registration_details(
                     reference, target, scale_x, scale_y,
                     output_size=(output_width, output_height))
@@ -1578,26 +1887,32 @@ class RebuildComposer:
                 x, y, x1, y1 = geometry.crop
                 crop_width = max(2, x1 - x)
                 crop_height = max(2, y1 - y)
+                registration_patch, registration_mask = self._registration_template(
+                    reference, (crop_width, crop_height))
+                self.last_patch_height, self.last_patch_width = registration_patch.shape[:2]
+                self.last_mask_height, self.last_mask_width = registration_mask.shape[:2]
+                registration = self._content_register(
+                    canvas, registration_patch, registration_mask, x, y)
+                self.last_content_reason = registration.reason
+                self.last_visible_ratio = registration.visible_ratio
+                if registration.score is not None:
+                    self.last_match_score = registration.score if self.last_match_score is None else max(
+                        self.last_match_score, registration.score)
+                if registration.position is None:
+                    self.registration_drops += 1
+                    self._record_drop(registration.reason)
+                    continue
+                if registration.score is not None:
+                    self.content_matches += 1
+                x, y = registration.position
+                self.last_registration_x = x
+                self.last_registration_y = y
                 patch, mask, enhanced = self._assets(
                     reference, (crop_width, crop_height), render_cache_keys)
-                if first_reference_frame:
+                if first_reference_frame and not using_handover:
                     if enhanced:
                         self.new_reference_first_frame_sr_hits += 1
                     self.last_sr_state = "HIT" if enhanced else "MISS"
-                corrected, score, attempted = self._content_register(
-                    canvas, patch, mask, x, y)
-                if attempted:
-                    if score is not None:
-                        self.last_match_score = score if self.last_match_score is None else max(
-                            self.last_match_score, score)
-                    if corrected is None:
-                        self.registration_drops += 1
-                        self.content_drops += 1
-                        self._record_drop("CONTENT")
-                        continue
-                    if score is not None:
-                        self.content_matches += 1
-                    x, y = corrected
                 feather_px = max(
                     3.0, min(10.0, max(
                         crop_width / float(max(1, reference.mask.shape[1])),
@@ -1611,8 +1926,14 @@ class RebuildComposer:
                     rebuilt_pixels[y0:y1, x0:x1] = np.maximum(
                         rebuilt_pixels[y0:y1, x0:x1], (mask_roi > 32).astype(np.uint8))
                 used_sr = used_sr or enhanced
-                self.last_sr_state = "HIT" if enhanced else self.last_sr_state
+                self.last_sr_state = (
+                    "HANDOVER" if using_handover else
+                    ("HIT" if enhanced else self.last_sr_state))
                 self.last_refs_used += 1
+                self._handover_references[(generation, target.track_id)] = (
+                    reference, target.class_id)
+                if using_handover:
+                    self.sr_handover_frames += 1
                 if self.draw_targets:
                     left = int(round(target.left * scale_x))
                     top = int(round(target.top * scale_y))
@@ -1626,13 +1947,24 @@ class RebuildComposer:
                                  0.36, (60, 220, 60), 1, cv2.LINE_AA)
             self._smooth_boxes = {
                 key: value for key, value in self._smooth_boxes.items()
-                if key in active_smooth_keys
+                if self._smooth_seen_at.get(key, 0.0) >= now - 1.0
+            }
+            self._smooth_seen_at = {
+                key: seen for key, seen in self._smooth_seen_at.items()
+                if key in self._smooth_boxes
             }
         else:
-            self._smooth_boxes.clear()
-            self._record_drop("STATE")
+            self._record_drop(
+                state_reason if state_reason.startswith("STATE_") else "STATE_INVALID")
+        self._handover_references = {
+            key: value for key, value in self._handover_references.items()
+            if key[0] == generation and
+            now - value[0].received_at <= self.reference_cache_ttl_ms / 1000.0
+        }
         self.last_spatial = "ROI-ESRGAN" if used_sr else (
             "ROI-LANCZOS" if self.last_refs_used else "BASE-LANCZOS")
+        if self.last_refs_used == 0 and self.last_drop_reason == "NONE":
+            self._record_drop("NO_TARGET")
         if output_width > 0 and output_height > 0:
             self.last_rebuild_percent = float(np.count_nonzero(rebuilt_pixels)) * 100.0 / (
                 output_width * output_height)
@@ -1658,6 +1990,8 @@ class RebuildComposer:
             "reference_content_age_ms": self.last_ref_content_age_ms,
             "reference_pts_ms": self.last_reference_pts_ms,
             "reference_generation": self.last_reference_generation,
+            "state_reference_generation": self.last_state_reference_generation,
+            "track_id": self.last_track_id,
             "rebuild_percent": self.last_rebuild_percent,
             "chroma_mode": self.last_chroma_mode,
             "reference_cache_ttl_ms": self.reference_cache_ttl_ms,
@@ -1675,6 +2009,14 @@ class RebuildComposer:
             "scale_drops": self.geom_scale_drops,
             "geom_outside_drops": self.geom_outside_drops,
             "last_drop_reason": self.last_drop_reason,
+            "content_reason": self.last_content_reason,
+            "registration_x": self.last_registration_x,
+            "registration_y": self.last_registration_y,
+            "patch_width": self.last_patch_width,
+            "patch_height": self.last_patch_height,
+            "mask_width": self.last_mask_width,
+            "mask_height": self.last_mask_height,
+            "visible_ratio": self.last_visible_ratio,
             "geom_dx_ratio": self.last_geom_dx_ratio,
             "geom_dy_ratio": self.last_geom_dy_ratio,
             "geom_area_ratio": self.last_geom_area_ratio,
@@ -1696,6 +2038,8 @@ class RebuildComposer:
             "sr_cache_hits": self.sr_cache_hits,
             "sr_cache_misses": self.sr_cache_misses,
             "last_sr_lookup": self.last_sr_lookup,
+            "sr_handover": self.last_sr_handover,
+            "sr_handover_frames": self.sr_handover_frames,
             "sr_last_ms": self.sr_last_ms,
             "sr_p50_ms": sr_p50_ms,
             "sr_p95_ms": sr_p95_ms,
